@@ -457,6 +457,7 @@ fn load_file(name: &str) -> Option<Config> {
     let text = std::fs::read_to_string(themes_dir().join(format!("{name}.toml"))).ok()?;
     let mut cfg: Config = toml::from_str(&text).ok()?;
     cfg.theme = name.into();
+    cfg.add_missing_segments();
     Some(cfg)
 }
 
@@ -494,6 +495,31 @@ pub fn list() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_configs_gain_new_segments_disabled() {
+        let mut cfg = builtin("nord").unwrap();
+        cfg.segments.retain(|s| s.id != SegmentId::Tps);
+        let enabled_before: Vec<_> = cfg
+            .segments
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.id)
+            .collect();
+        cfg.add_missing_segments();
+        let tps = cfg.segment(SegmentId::Tps).unwrap();
+        assert!(!tps.enabled);
+        // styled like the nord preset (powerline background)
+        assert!(tps.colors.background.is_some());
+        assert_eq!(cfg.segments.last().unwrap().id, SegmentId::Tps);
+        let enabled_after: Vec<_> = cfg
+            .segments
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(enabled_before, enabled_after);
+    }
 
     #[test]
     fn every_builtin_round_trips_through_toml() {

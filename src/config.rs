@@ -327,7 +327,32 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(String::new()),
             Err(e) => return Err(e.to_string()),
         };
-        toml::from_str(&text).map_err(|e| e.to_string())
+        let mut cfg: Config = toml::from_str(&text).map_err(|e| e.to_string())?;
+        cfg.add_missing_segments();
+        Ok(cfg)
+    }
+
+    /// Segments added in a newer version than the one that wrote this
+    /// config: append them, disabled, styled like the same theme's built-in
+    /// preset, so they show up in the configurator without changing what
+    /// the status line already renders.
+    pub fn add_missing_segments(&mut self) {
+        let missing: Vec<SegmentId> = SegmentId::ALL
+            .into_iter()
+            .filter(|id| self.segment(*id).is_none())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let preset = crate::themes::builtin(&self.theme)
+            .or_else(|| crate::themes::builtin("kimi"))
+            .expect("kimi theme");
+        for id in missing {
+            if let Some(mut seg) = preset.segment(id).cloned() {
+                seg.enabled = false;
+                self.segments.push(seg);
+            }
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
