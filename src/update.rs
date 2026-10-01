@@ -427,6 +427,16 @@ mod tests {
         replace_binary(&exe, &bin).unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), b"NEWBN");
         let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                std::fs::read(exe.with_extension("exe.old")).unwrap(),
+                b"OLD",
+                "Windows keeps the old executable while it may still be running"
+            );
+            assert_eq!(leftovers.len(), 2, "only the new binary and backup remain");
+        }
+        #[cfg(not(windows))]
         assert_eq!(leftovers.len(), 1, "staged file cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
     }
