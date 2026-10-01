@@ -19,6 +19,7 @@ mod render;
 mod session;
 mod themes;
 mod tui;
+mod update;
 
 use clap::{Parser, Subcommand};
 use config::{Config, SegmentId};
@@ -73,6 +74,12 @@ enum Cmd {
     Themes,
     /// Fetch plan quota now and print it (5h / 7d / monthly)
     Quota,
+    /// Check GitHub for a newer release and install it
+    Update {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+    },
     /// Background quota refresh, spawned by the status line
     #[command(hide = true)]
     FetchQuota,
@@ -135,6 +142,7 @@ fn main() {
                 Some(last) if last != e => format!("{e} (previous: {last})"),
                 _ => e,
             }),
+        Some(Cmd::Update { check }) => update_cmd(check),
         Some(Cmd::FetchQuota) => {
             let _ = quota::fetch_and_store();
             Ok(())
@@ -160,6 +168,30 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+fn update_cmd(check_only: bool) -> Result<(), String> {
+    let latest = update::check_now()?;
+    if !update::is_newer(&latest, update::CURRENT) {
+        println!("kimi-statusline {} is up to date", update::CURRENT);
+        return Ok(());
+    }
+    println!("Update available: {} → {latest}", update::CURRENT);
+    if check_only {
+        return Ok(());
+    }
+    let kind = update::install_kind();
+    if let Some(how) = update::manual_instructions(&kind) {
+        println!("This copy was {how}");
+        return Ok(());
+    }
+    let update::InstallKind::Standalone(exe) = kind else {
+        unreachable!()
+    };
+    let v = update::install(&latest, &exe)?;
+    println!("Updated {} to {v} (checksum verified)", exe.display());
+    println!("The status line uses it on its next refresh.");
+    Ok(())
 }
 
 fn current_dir() -> String {

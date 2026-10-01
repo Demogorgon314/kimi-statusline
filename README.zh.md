@@ -145,11 +145,12 @@ kimi-statusline 不会自己刷新登录凭据：和 Kimi Code 抢着更换 toke
 <summary>命令、调试、卸载</summary>
 
 ```bash
-kimi-statusline                 # 菜单：配置、安装、测试额度……
+kimi-statusline                 # 菜单：配置、安装、测试额度、检查更新……
 kimi-statusline config          # 配置器
 kimi-statusline themes          # 列出主题
 kimi-statusline -t nord preview # 在终端里预览某个主题
 kimi-statusline quota           # 立即拉取额度
+kimi-statusline update          # 更新到最新版本（加 --check 只检查）
 kimi-statusline uninstall       # 从 tui.toml 移除，然后 /reload-tui
 ```
 

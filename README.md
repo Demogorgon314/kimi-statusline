@@ -145,11 +145,12 @@ kimi-statusline never refreshes your login itself — racing Kimi Code's token r
 <summary>Commands, debugging, uninstall</summary>
 
 ```bash
-kimi-statusline                 # menu: configure, install, test quota…
+kimi-statusline                 # menu: configure, install, test quota, check for updates…
 kimi-statusline config          # configurator
 kimi-statusline themes          # list themes
 kimi-statusline -t nord preview # render a theme in your terminal
 kimi-statusline quota           # fetch quota now
+kimi-statusline update          # update to the latest release (--check to only look)
 kimi-statusline uninstall       # remove from tui.toml, then /reload-tui
 ```
 

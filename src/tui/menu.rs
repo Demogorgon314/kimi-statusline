@@ -1,12 +1,13 @@
 use super::{button, button_bar, Hits};
 use crate::config::{config_path, Config};
-use crate::{install, quota, themes};
+use crate::{install, quota, themes, update};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use std::sync::mpsc;
 
 /// The project page, from Cargo.toml's `repository`.
 pub const REPO: &str = env!("CARGO_PKG_REPOSITORY");
@@ -31,15 +32,36 @@ pub struct Menu {
     status: Option<(String, bool)>,
     about: bool,
     hits: Hits<Target>,
+    /// newest release tag, when it is newer than this build
+    available: Option<String>,
+    /// background check started when the menu opened
+    check: Option<mpsc::Receiver<Result<String, String>>>,
+    /// waiting for a second Enter/click to install `available`
+    confirm_update: bool,
 }
 
 impl Default for Menu {
     fn default() -> Self {
+        // reuse a check from the last day, otherwise ask GitHub in the
+        // background so the menu opens instantly even offline
+        let (available, check) = match update::cached_latest() {
+            Some(tag) => (Some(tag), None),
+            None => {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(update::check_now());
+                });
+                (None, Some(rx))
+            }
+        };
         Menu {
             selected: 0,
             status: None,
             about: false,
             hits: Hits::new(),
+            available: available.filter(|t| update::is_newer(t, update::CURRENT)),
+            check,
+            confirm_update: false,
         }
     }
 }
@@ -48,7 +70,7 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-const ITEMS: [(&str, &str); 8] = [
+const ITEMS: [(&str, &str); 9] = [
     (
         "Configuration Mode",
         "Edit segments, colors, icons and themes",
@@ -64,11 +86,83 @@ const ITEMS: [(&str, &str); 8] = [
         "Remove our [status_line].command",
     ),
     ("Test Quota", "Fetch 5h / 7d plan quota now"),
+    ("Check for Updates", "Look for a newer release on GitHub"),
     ("About", "Show application information"),
     ("Exit", "Leave kimi-statusline"),
 ];
+const UPDATE_ITEM: usize = 6;
 
 impl Menu {
+    /// Pick up the background check's answer; true when it changed the
+    /// screen.
+    pub fn poll(&mut self) -> bool {
+        let Some(rx) = &self.check else { return false };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.check = None;
+                if let Ok(tag) = result {
+                    if update::is_newer(&tag, update::CURRENT) {
+                        self.available = Some(tag);
+                        return true;
+                    }
+                }
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.check = None;
+                false
+            }
+        }
+    }
+
+    /// First press checks (and offers the update); a second press, once an
+    /// update is on offer, installs it.
+    fn run_update(&mut self) {
+        if self.confirm_update {
+            self.confirm_update = false;
+            let Some(tag) = self.available.clone() else {
+                return;
+            };
+            let kind = update::install_kind();
+            if let Some(how) = update::manual_instructions(&kind) {
+                self.ok(format!("{tag} is available. This copy was {how}"));
+                return;
+            }
+            let update::InstallKind::Standalone(exe) = kind else {
+                return;
+            };
+            match update::install(&tag, &exe) {
+                Ok(v) => {
+                    self.available = None;
+                    self.ok(format!(
+                        "✓ Updated to {v} (checksum verified). Restart kimi-statusline to use it here; the status line already does"
+                    ))
+                }
+                Err(e) => self.err(format!("✗ Update failed: {e}")),
+            }
+            return;
+        }
+        match update::check_now() {
+            Ok(tag) if update::is_newer(&tag, update::CURRENT) => {
+                self.available = Some(tag.clone());
+                self.confirm_update = true;
+                self.ok(format!(
+                    "{tag} is available (you have v{}). Press Enter or click again to install",
+                    update::CURRENT
+                ));
+            }
+            Ok(_) => {
+                self.available = None;
+                self.ok(format!(
+                    "✓ kimi-statusline v{} is up to date",
+                    update::CURRENT
+                ));
+            }
+            Err(e) => self.err(format!("✗ {e}")),
+        }
+    }
+
     fn ok(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), false));
     }
@@ -81,6 +175,11 @@ impl Menu {
         if self.about {
             self.about = false;
             return Action::Stay;
+        }
+        let keep_confirm =
+            self.confirm_update && self.selected == UPDATE_ITEM && k.code == KeyCode::Enter;
+        if !keep_confirm {
+            self.confirm_update = false;
         }
         self.status = None;
         match k.code {
@@ -118,6 +217,7 @@ impl Menu {
             Target::Item(i) => {
                 self.selected = i;
                 self.status = None;
+                self.confirm_update = false;
                 Some(Action::Stay)
             }
             Target::Key(k) => Some(self.key(k)),
@@ -184,7 +284,8 @@ impl Menu {
                 }
                 Err(e) => self.err(format!("✗ {e}")),
             },
-            6 => self.about = true,
+            UPDATE_ITEM => self.run_update(),
+            7 => self.about = true,
             _ => return Action::Quit,
         }
         Action::Stay
@@ -220,6 +321,13 @@ impl Menu {
                     ),
                     Span::styled(" v", Style::new().fg(Color::Gray)),
                     Span::styled(env!("CARGO_PKG_VERSION"), Style::new().fg(Color::Yellow)),
+                    Span::styled(
+                        self.available
+                            .as_ref()
+                            .map(|t| format!("  ↑ {t} available"))
+                            .unwrap_or_default(),
+                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(""),
                 Line::styled(
@@ -251,11 +359,21 @@ impl Menu {
 
         let items: Vec<ListItem> = ITEMS
             .iter()
-            .map(|(t, d)| {
-                ListItem::new(Line::from(vec![
+            .enumerate()
+            .map(|(i, (t, d))| {
+                let mut spans = vec![
                     Span::raw(format!(" {t}")),
                     Span::styled(format!(" - {d}"), Style::new().fg(Color::Gray)),
-                ]))
+                ];
+                if i == UPDATE_ITEM {
+                    if let Some(tag) = &self.available {
+                        spans.push(Span::styled(
+                            format!("  ● {tag} available"),
+                            Style::new().fg(Color::Green),
+                        ));
+                    }
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         let mut state = ListState::default().with_selected(Some(self.selected));

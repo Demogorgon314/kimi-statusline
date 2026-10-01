@@ -146,8 +146,16 @@ pub fn run_menu() -> Result<(), String> {
         let mut menu = menu::Menu::default();
         let mut redraw = true;
         loop {
+            if menu.poll() {
+                redraw = true;
+            }
             if redraw {
                 terminal.draw(|f| menu.draw(f))?;
+            }
+            // wake up now and then to pick up the background update check
+            if !event::poll(std::time::Duration::from_millis(250))? {
+                redraw = false;
+                continue;
             }
             let action = match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => Some(menu.key(k)),
