@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 /// Most bytes one wire may contribute per run; a huge first sighting is spread
 /// over several refreshes instead of blowing the 300ms cap (a killed run saves
 /// nothing, so it would re-read the same bytes forever).
@@ -64,37 +64,65 @@ pub struct Cursor {
     mid: bool,
     bound: Option<String>,
     real: Option<String>,
-    /// time (ms) of this agent's last llm.request not yet matched by a
-    /// usage.record, for timing the call
-    pending_req: Option<f64>,
 }
 
-/// One timed model call: llm.request → usage.record, wall clock in ms.
+/// `context.append_loop_event` wrapping a `step.end`: Kimi Code's own
+/// measurement of the model call that just finished (see upstream
+/// human/timing/plugin.ts).
+#[derive(Deserialize)]
+struct LoopEvent {
+    #[serde(default)]
+    time: Option<f64>,
+    #[serde(default)]
+    event: Option<StepEnd>,
+}
+
+#[derive(Deserialize)]
+struct StepEnd {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    usage: Option<Usage>,
+    /// first streamed delta → stream done: the decode phase only
+    #[serde(rename = "llmStreamDurationMs", default)]
+    stream_ms: Option<f64>,
+    /// request sent → first delta (queueing + prefill)
+    #[serde(rename = "llmFirstTokenLatencyMs", default)]
+    ttft_ms: Option<f64>,
+}
+
+/// One model call, timed by Kimi Code: when its stream started and ended
+/// (unix ms), and the output tokens it produced.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Call {
     pub agent: String,
     pub start: f64,
     pub end: f64,
     pub output: u64,
+    /// time to first token, ms
+    pub ttft: f64,
 }
 
 impl Call {
+    /// Decode speed: output tokens over the streaming time, the standard
+    /// definition of TPS. Time to first token is excluded (it is queueing
+    /// and prefill, not generation) and kept separately.
     pub fn rate(&self) -> f64 {
         self.output as f64 / ((self.end - self.start) / 1000.0)
     }
 }
 
 /// Generation speed across every agent. Sub-agents run in parallel with
-/// each other while the main agent waits, so a per-call rate alone would
-/// understate how fast tokens are actually arriving: `recent` keeps the
-/// latest calls of all agents so the renderer can also sum overlapping
-/// ones into a combined throughput.
+/// each other while the main agent waits, so per-call speed alone would
+/// understate how fast tokens arrive: `recent` keeps the latest calls of
+/// all agents so overlapping ones can be summed into a combined rate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Speed {
-    /// latest calls of any agent, oldest first, capped at RECENT_CAP
+    /// latest calls of any agent, ordered by end time, capped at RECENT_CAP
     pub recent: Vec<Call>,
-    /// totals over all timed calls, for the per-call session average
+    /// session totals over all measured calls: output tokens and seconds
+    /// of streaming, for a token-weighted average
     pub output: u64,
     pub secs: f64,
 }
@@ -103,33 +131,38 @@ pub struct Speed {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Throughput {
     pub tokens_per_sec: f64,
-    /// most calls generating at the same moment within the window
+    /// most calls streaming at the same moment within the window
     pub agents: usize,
 }
 
 impl Speed {
     const RECENT_CAP: usize = 64;
-    /// Calls shorter than this are skipped: a 0.4 s tool-call stub makes a
-    /// wildly noisy rate.
-    const MIN_SECS: f64 = 1.0;
+    /// Streams shorter than this are left out. Tokens arrive in network
+    /// bursts, so a 150 ms tool-call stream of 60 tokens reads as ~400
+    /// tok/s: the burst size, not the model's speed.
+    const MIN_STREAM_MS: f64 = 1000.0;
 
-    fn record(&mut self, agent: &str, start: f64, end: f64, output: u64) {
-        let secs = (end - start) / 1000.0;
-        if secs < Self::MIN_SECS || output == 0 {
+    fn record_step(&mut self, agent: &str, step: &StepEnd, line_time: Option<f64>) {
+        let (Some(stream_ms), Some(usage), Some(end)) = (step.stream_ms, step.usage, line_time)
+        else {
+            return;
+        };
+        if stream_ms < Self::MIN_STREAM_MS || usage.output == 0 {
             return;
         }
-        self.output += output;
-        self.secs += secs;
+        self.output += usage.output;
+        self.secs += stream_ms / 1000.0;
         // agents are parsed one file at a time, so calls arrive out of
-        // time order: insert sorted by end
+        // time order: keep the list sorted by end
         let at = self.recent.partition_point(|c| c.end <= end);
         self.recent.insert(
             at,
             Call {
                 agent: agent.to_string(),
-                start,
+                start: end - stream_ms,
                 end,
-                output,
+                output: usage.output,
+                ttft: step.ttft_ms.unwrap_or(0.0),
             },
         );
         if self.recent.len() > Self::RECENT_CAP {
@@ -142,23 +175,24 @@ impl Speed {
         self.recent.last()
     }
 
-    /// Per-call average over the session (tokens per second of generation
-    /// time, whichever agent produced them).
+    /// Session average, token-weighted: all output tokens over all
+    /// streaming seconds. (A mean of per-call rates would let a handful of
+    /// short, bursty calls skew it.)
     pub fn average(&self) -> Option<f64> {
         (self.secs > 0.0).then(|| self.output as f64 / self.secs)
     }
 
     /// Combined rate over the `window_secs` before the latest call ended.
-    /// Overlapping calls add up (three sub-agents at 30 tok/s each are
-    /// 90 tok/s); a call reaching back before the window counts only its
-    /// share inside it.
+    /// Overlapping streams add up (three sub-agents at 30 tok/s each are
+    /// 90 tok/s); a call reaching back before the window counts only the
+    /// share of its tokens that falls inside it.
     pub fn throughput(&self, window_secs: f64) -> Option<Throughput> {
         let end = self.recent.last()?.end;
         let from = end - window_secs * 1000.0;
         let mut tokens = 0.0;
         let mut earliest = end;
         // (time, +1 start / -1 end) for a sweep: peak overlap is how many
-        // agents were truly in flight together. Counting every agent that
+        // agents were truly streaming together. Counting every agent that
         // touched the window would also count a main-agent call that ended
         // just before the sub-agents it spawned started.
         let mut edges: Vec<(f64, i32)> = Vec::new();
@@ -361,7 +395,7 @@ fn record_type(line: &[u8]) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-const WANTED: [&str; 8] = [
+const WANTED: [&str; 9] = [
     "usage.record",
     "profile.bind",
     "llm.request",
@@ -370,6 +404,7 @@ const WANTED: [&str; 8] = [
     "swarm_mode.exit",
     "tower_mode.enter",
     "tower_mode.exit",
+    "context.append_loop_event",
 ];
 
 #[derive(Deserialize)]
@@ -384,9 +419,6 @@ struct Rec {
     thinking_level: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<Usage>,
-    /// unix ms
-    #[serde(default)]
-    time: Option<f64>,
 }
 
 /// Fold everything appended since `prior` into fresh stats.
@@ -427,6 +459,23 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
             if !WANTED.contains(&kind) {
                 continue;
             }
+            if kind == "context.append_loop_event" {
+                // the vast majority are tool calls/results; only step.end
+                // (which carries the call's timing) is worth decoding
+                const NEEDLE: &[u8] = br#"{"type":"step.end""#;
+                if !line[..line.len().min(160)]
+                    .windows(NEEDLE.len())
+                    .any(|w| w == NEEDLE)
+                {
+                    continue;
+                }
+                if let Ok(ev) = serde_json::from_slice::<LoopEvent>(line) {
+                    if let Some(step) = ev.event.filter(|e| e.kind == "step.end") {
+                        st.speed.record_step(&agent, &step, ev.time);
+                    }
+                }
+                continue;
+            }
             match kind {
                 "swarm_mode.enter" | "swarm_mode.exit" => {
                     if is_main {
@@ -453,9 +502,6 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
                     if kind == "llm.request" && rec.model.is_some() {
                         cur.real = rec.model.clone();
                     }
-                    if kind == "llm.request" {
-                        cur.pending_req = rec.time;
-                    }
                     if is_main {
                         if let Some(e) = rec.thinking_effort.or(rec.thinking_level) {
                             if !e.is_null() {
@@ -470,9 +516,6 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
                     // request → usage wall time covers the whole call
                     // (time to first token included), so this is the speed
                     // you actually experience, not the decoder's peak
-                    if let (Some(t0), Some(t1)) = (cur.pending_req.take(), rec.time) {
-                        st.speed.record(&agent, t0, t1, u.output);
-                    }
                     if is_main {
                         st.main.add(&u);
                         continue;
@@ -504,40 +547,60 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
 mod tests {
     use super::*;
 
+    /// A step.end loop event as Kimi Code writes it: stream finished at
+    /// `end` ms after streaming for `stream` ms.
+    fn step_end(end: u64, out: u64, stream: u64, ttft: u64) -> String {
+        format!(
+            r#"{{"type":"context.append_loop_event","agentId":"x","event":{{"type":"step.end","uuid":"u","step":1,"finishReason":"tool_use","usage":{{"inputOther":1,"output":{out},"inputCacheRead":0,"inputCacheCreation":0}},"llmFirstTokenLatencyMs":{ttft},"llmStreamDurationMs":{stream}}},"time":{end}}}"#
+        )
+    }
+
     #[test]
-    fn speed_pairs_request_with_usage() {
+    fn speed_uses_stream_time_not_wall_time() {
         let dir = std::env::temp_dir().join(format!("kimi-sl-speed-{}", std::process::id()));
         for a in ["main", "agent-0", "agent-1"] {
             std::fs::create_dir_all(dir.join("agents").join(a)).unwrap();
         }
-        let wire = |a: &str, body: &str| {
+        let wire = |a: &str, lines: &[String]| {
+            let body = lines.join("\n") + "\n";
             std::fs::write(dir.join("agents").join(a).join("wire.jsonl"), body).unwrap()
         };
-        let req = |t: u64| format!(r#"{{"type":"llm.request","model":"k3","time":{t}}}"#);
-        let usage = |out: u64, t: u64| {
-            format!(
-                r#"{{"type":"usage.record","usage":{{"inputOther":1,"output":{out},"inputCacheRead":0,"inputCacheCreation":0}},"time":{t}}}"#
-            )
-        };
-        // main: one 10 s call at 40 tok/s, then a sub-second stub (ignored)
-        let main = [req(0), usage(400, 10000), req(10100), usage(5, 10500)];
-        wire("main", &(main.join("\n") + "\n"));
-        // two sub-agents in parallel, 10 s each at 30 tok/s, ending last
-        for (a, end) in [("agent-0", 25000), ("agent-1", 24000)] {
-            wire(a, &(req(end - 10000) + "\n" + &usage(300, end) + "\n"));
-        }
+        // main: 400 tokens streamed in 10 s after a 5 s first-token wait:
+        // 40 tok/s (wall clock would say 26.7). Then a 150 ms burst of 60
+        // tokens (a tool-call stub) that must not count.
+        // A tool result that merely quotes "step.end" must not count either.
+        let quoted = r#"{"type":"context.append_loop_event","event":{"type":"tool.result","output":"{\"type\":\"step.end\""}}"#;
+        wire(
+            "main",
+            &[
+                step_end(15000, 400, 10000, 5000),
+                step_end(16000, 60, 150, 800),
+                quoted.into(),
+            ],
+        );
+        // two sub-agents streaming in parallel, 10 s each at 30 tok/s
+        wire("agent-0", &[step_end(25000, 300, 10000, 2000)]);
+        wire("agent-1", &[step_end(24000, 300, 10000, 2000)]);
+
         let st = parse_session(&dir, None);
+        let main_call = st.speed.recent.iter().find(|c| c.agent == "main").unwrap();
+        assert_eq!(main_call.rate(), 40.0);
+        assert_eq!(main_call.ttft, 5000.0);
+        assert_eq!(st.speed.recent.len(), 3, "stub burst excluded");
         let last = st.speed.last().unwrap();
         assert_eq!((last.agent.as_str(), last.rate()), ("agent-0", 30.0));
+        // token-weighted: 1000 tokens over 30 s of streaming
         assert_eq!(st.speed.average(), Some(1000.0 / 30.0));
-        // last 12 s: both sub-agents fully inside → 600 tokens over 11 s
+        // last 12 s (13-25 s): both sub-agents fully inside (600 tokens),
+        // plus the 2 s tail of main's 5-15 s stream (80 of its 400) → 680
+        // tokens over 12 s
         let tp = st.speed.throughput(12.0).unwrap();
         assert_eq!(tp.agents, 2);
-        // a window reaching back over main's call: main ran alone, so the
-        // peak is still the two sub-agents
+        assert!((tp.tokens_per_sec - 680.0 / 12.0).abs() < 1e-9, "{tp:?}");
+        // a window reaching back over main's call: main streamed alone, so
+        // the peak is still the two sub-agents
         assert_eq!(st.speed.throughput(60.0).unwrap().agents, 2);
-        assert!((tp.tokens_per_sec - 600.0 / 11.0).abs() < 1e-9);
-        // last 2 s (23-25 s): both generate for 1 s at 60 tok/s, then only
+        // last 2 s (23-25 s): both stream for 1 s at 60 tok/s, then only
         // agent-0 for 1 s at 30 tok/s → 90 tokens / 2 s
         let tp = st.speed.throughput(2.0).unwrap();
         assert!((tp.tokens_per_sec - 45.0).abs() < 1e-9, "{tp:?}");

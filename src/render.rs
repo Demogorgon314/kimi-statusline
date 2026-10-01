@@ -567,9 +567,9 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
     (!spans.is_empty()).then_some(spans)
 }
 
-/// `33.1 tok/s · ×3 96 tok/s (avg 31.4)`: the latest call's speed (any
-/// agent); while several agents are generating at once, their combined
-/// throughput and count; and the session's per-call average. Hidden once
+/// `33.1 tok/s · ×3 96 tok/s (avg 31.4)`: the latest call's decode speed
+/// (any agent); while several agents are streaming at once, their combined
+/// throughput and count; and the session's token-weighted average. Hidden once
 /// the last call is older than `stale_secs`, so an idle session doesn't
 /// keep showing an old number.
 fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {

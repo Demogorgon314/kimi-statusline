@@ -101,7 +101,7 @@ Kimi Code runs the status line every second and kills it after 300 ms. kimi-stat
 | `subagent` | Same, for the heaviest sub-agent model |
 | `session` | Session age (off by default) |
 | `quota` | 5h / 7d (optionally monthly) usage and reset time |
-| `tps` | Output speed: `34.6 tok/s · ×3 90 tok/s (avg 31.2)` — the latest call, plus combined throughput while sub-agents run in parallel (off by default) |
+| `tps` | Decode speed: `42.1 tok/s · ×3 118 tok/s (avg 40.3)` — the latest call (tokens over streaming time, from Kimi Code's own timing), plus combined throughput while sub-agents stream in parallel (off by default) |
 
 When space runs out, segments drop in this order: session → tps → git → directory → subagent → tasks → goal → context → quota → mode.
 
