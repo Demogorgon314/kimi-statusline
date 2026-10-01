@@ -1,14 +1,20 @@
 //! The configurator: title, live preview, theme bar, segment list, settings
 //! panel and a key-help bar, laid out like CCometixLine's.
 
-use super::pickers::{centered, to_ratatui, ColorPicker, IconPicker, Outcome, SeparatorEditor};
+use super::pickers::{
+    centered, to_ratatui, Click, ClickMap, ColorPicker, IconPicker, Outcome, SeparatorEditor,
+};
+use super::{button, button_bar, Button, Hits};
 use crate::config::{AnsiColor, Config, Lang, SegmentConfig, SegmentId, StyleMode};
 use crate::quota::{Entry, Quota};
 use crate::render::Ctx;
 use crate::session::{SessionStats, Usage};
 use crate::{collect, kimi_config, themes};
 use ansi_to_tui::IntoText;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -50,6 +56,25 @@ enum TextTarget {
     SaveTheme,
 }
 
+/// What a click on the main screen lands on.
+#[derive(Clone)]
+enum Target {
+    Segment(usize),
+    /// the [✓] box of a segment: toggles without selecting first
+    SegmentCheck(usize),
+    Field(usize),
+    Theme(String),
+    /// "mode: …" etc. in the preview border
+    Key(KeyEvent),
+    /// click anywhere to dismiss (help popup)
+    Dismiss,
+    Popup(Click),
+    /// inside a popup but not on anything: swallow
+    Inert,
+    /// outside an open popup: close it
+    Outside,
+}
+
 pub struct App {
     config: Config,
     saved: Config,
@@ -61,6 +86,7 @@ pub struct App {
     status: Option<String>,
     confirm_quit: bool,
     quit: bool,
+    hits: Hits<Target>,
 }
 
 /// Plausible numbers for whatever the current directory's session lacks, so
@@ -145,17 +171,25 @@ impl App {
             status: None,
             confirm_quit: false,
             quit: false,
+            hits: Hits::new(),
         }
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        let mut redraw = true;
         while !self.quit {
-            terminal.draw(|f| self.draw(f))?;
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    self.key(k);
-                }
+            if redraw {
+                terminal.draw(|f| self.draw(f))?;
             }
+            redraw = match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    self.key(k);
+                    true
+                }
+                Event::Mouse(m) => self.mouse(m),
+                Event::Resize(..) => true,
+                _ => false,
+            };
         }
         Ok(())
     }
@@ -221,6 +255,150 @@ impl App {
             );
             self.status = Some(msg);
         }
+    }
+
+    /// Returns whether anything changed.
+    fn mouse(&mut self, m: MouseEvent) -> bool {
+        let scroll = match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => None,
+            MouseEventKind::ScrollUp => Some(false),
+            MouseEventKind::ScrollDown => Some(true),
+            _ => return false,
+        };
+        if let Some(down) = scroll {
+            return self.scroll(down, m.column, m.row);
+        }
+        let Some(target) = self.hits.at(m.column, m.row) else {
+            return false;
+        };
+        // a click on [Esc] Quit goes through key(), which keeps the pending
+        // quit confirmation; anything else cancels it
+        if !matches!(&target, Target::Key(k) if k.code == KeyCode::Esc) {
+            self.confirm_quit = false;
+        }
+        match target {
+            Target::Segment(i) => {
+                if self.panel == Panel::Segments && self.seg == i {
+                    self.toggle_segment();
+                } else {
+                    self.panel = Panel::Segments;
+                    self.seg = i;
+                    self.field = 0;
+                }
+            }
+            Target::SegmentCheck(i) => {
+                self.panel = Panel::Segments;
+                self.seg = i;
+                self.field = 0;
+                self.toggle_segment();
+            }
+            Target::Field(i) => {
+                if self.panel == Panel::Settings && self.field == i {
+                    self.edit_field();
+                } else {
+                    self.panel = Panel::Settings;
+                    self.field = i;
+                }
+            }
+            Target::Theme(name) => self.switch_theme(&name),
+            Target::Key(k) => self.key(k),
+            Target::Dismiss | Target::Outside => self.popup = None,
+            Target::Popup(c) => {
+                if let Some(popup) = self.popup.take() {
+                    self.popup_click(popup, c);
+                }
+            }
+            Target::Inert => {}
+        }
+        true
+    }
+
+    /// The wheel moves whatever list is under the pointer.
+    fn scroll(&mut self, down: bool, column: u16, row: u16) -> bool {
+        let step = if down { 1 } else { -1 };
+        match &mut self.popup {
+            Some(Popup::Icon(p)) => p.scroll(down),
+            Some(_) => return false,
+            None => match self.hits.at(column, row) {
+                Some(Target::Field(_)) => {
+                    self.panel = Panel::Settings;
+                    self.nav(step);
+                }
+                Some(Target::Segment(_) | Target::SegmentCheck(_)) => {
+                    self.panel = Panel::Segments;
+                    self.nav(step);
+                }
+                _ => self.nav(step),
+            },
+        }
+        true
+    }
+
+    fn popup_click(&mut self, popup: Popup, c: Click) {
+        match popup {
+            Popup::Color(mut p, field) => match p.click(c) {
+                Outcome::Pending => self.popup = Some(Popup::Color(p, field)),
+                Outcome::Cancel => {}
+                Outcome::Done(color) => self.apply_color(field, color),
+            },
+            Popup::Icon(mut p) => match p.click(c) {
+                Outcome::Pending => self.popup = Some(Popup::Icon(p)),
+                Outcome::Cancel => {}
+                Outcome::Done((nerd, icon)) => self.apply_icon(nerd, icon),
+            },
+            Popup::Separator(mut p) => match p.click(c) {
+                Outcome::Pending => self.popup = Some(Popup::Separator(p)),
+                Outcome::Cancel => {}
+                Outcome::Done(sep) => self.apply_separator(sep),
+            },
+            Popup::Text {
+                title,
+                input,
+                target,
+            } => match c {
+                Click::Key(KeyCode::Enter) => self.commit_text(input, target),
+                Click::Key(KeyCode::Esc) => {}
+                _ => {
+                    self.popup = Some(Popup::Text {
+                        title,
+                        input,
+                        target,
+                    })
+                }
+            },
+            Popup::Help => {}
+        }
+    }
+
+    fn apply_color(&mut self, field: Field, color: Option<AnsiColor>) {
+        if let Some(seg) = self.current_mut() {
+            match field {
+                Field::IconColor => seg.colors.icon = color,
+                Field::TextColor => seg.colors.text = color,
+                Field::BgColor => seg.colors.background = color,
+                _ => {}
+            }
+        }
+        self.status = Some("Color updated".into());
+    }
+
+    fn apply_icon(&mut self, nerd: bool, icon: String) {
+        if let Some(seg) = self.current_mut() {
+            if nerd {
+                seg.icon.nerd_font = icon;
+            } else {
+                seg.icon.plain = icon;
+            }
+        }
+        self.status = Some(format!(
+            "{} icon updated",
+            if nerd { "Nerd Font" } else { "Plain" }
+        ));
+    }
+
+    fn apply_separator(&mut self, sep: String) {
+        self.config.style.separator = sep;
+        self.status = Some("Separator updated".into());
     }
 
     fn key(&mut self, k: KeyEvent) {
@@ -433,42 +611,17 @@ impl App {
             Popup::Color(mut p, field) => match p.key(k) {
                 Outcome::Pending => self.popup = Some(Popup::Color(p, field)),
                 Outcome::Cancel => {}
-                Outcome::Done(color) => {
-                    if let Some(seg) = self.current_mut() {
-                        match field {
-                            Field::IconColor => seg.colors.icon = color,
-                            Field::TextColor => seg.colors.text = color,
-                            Field::BgColor => seg.colors.background = color,
-                            _ => {}
-                        }
-                    }
-                    self.status = Some("Color updated".into());
-                }
+                Outcome::Done(color) => self.apply_color(field, color),
             },
             Popup::Icon(mut p) => match p.key(k) {
                 Outcome::Pending => self.popup = Some(Popup::Icon(p)),
                 Outcome::Cancel => {}
-                Outcome::Done((nerd, icon)) => {
-                    if let Some(seg) = self.current_mut() {
-                        if nerd {
-                            seg.icon.nerd_font = icon;
-                        } else {
-                            seg.icon.plain = icon;
-                        }
-                    }
-                    self.status = Some(format!(
-                        "{} icon updated",
-                        if nerd { "Nerd Font" } else { "Plain" }
-                    ));
-                }
+                Outcome::Done((nerd, icon)) => self.apply_icon(nerd, icon),
             },
             Popup::Separator(mut p) => match p.key(k) {
                 Outcome::Pending => self.popup = Some(Popup::Separator(p)),
                 Outcome::Cancel => {}
-                Outcome::Done(sep) => {
-                    self.config.style.separator = sep;
-                    self.status = Some("Separator updated".into());
-                }
+                Outcome::Done(sep) => self.apply_separator(sep),
             },
             Popup::Text {
                 title,
@@ -533,14 +686,17 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
+        self.hits.clear();
         let area = f.area();
         let inner_w = area.width.saturating_sub(2) as usize;
         let preview = self.preview(inner_w.max(20));
         let themes_list = themes::list();
-        let theme_lines = theme_bar(&themes_list, &self.config.theme, inner_w);
-        let help = help_items(self.panel);
-        let help_lines =
-            wrap_items(&help, inner_w).len() as u16 + if self.status.is_some() { 1 } else { 0 };
+        let (theme_lines, theme_pos) = theme_bar(&themes_list, &self.config.theme, inner_w);
+        let help = help_buttons(self.panel);
+        let probe = Rect::new(0, 0, inner_w as u16, u16::MAX);
+        // one row is always reserved for the status message, so a message
+        // appearing never moves the buttons out from under the pointer
+        let help_lines = button_bar(&help, probe).0.len() as u16 + 1;
 
         let [title, preview_area, theme_area, body, help_area] = Layout::vertical([
             Constraint::Length(3),
@@ -575,20 +731,52 @@ impl App {
         let text = strip_osc(&preview)
             .into_text()
             .unwrap_or_else(|_| Text::raw(preview.clone()));
+        // the style summary in the preview's bottom border: each part is a
+        // button for the key that changes it
+        let parts = [
+            (format!("mode: {}", self.config.style.mode.name()), 'm'),
+            (format!("sep: {:?}", self.config.style.separator), 'e'),
+            (
+                format!(
+                    "lang: {}",
+                    match self.config.style.lang {
+                        Lang::En => "en",
+                        Lang::Zh => "zh",
+                    }
+                ),
+                'l',
+            ),
+            (
+                format!(
+                    "colors: {}",
+                    if self.config.style.palette.is_empty() {
+                        "tui.toml"
+                    } else {
+                        &self.config.style.palette
+                    }
+                ),
+                'c',
+            ),
+        ];
         let style_info = format!(
-            " mode: {} · sep: {:?} · lang: {} · colors: {} ",
-            self.config.style.mode.name(),
-            self.config.style.separator,
-            match self.config.style.lang {
-                Lang::En => "en",
-                Lang::Zh => "zh",
-            },
-            if self.config.style.palette.is_empty() {
-                "tui.toml"
-            } else {
-                &self.config.style.palette
-            },
+            " {} ",
+            parts
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ")
         );
+        let info_w = style_info.chars().count() as u16;
+        let info_x = preview_area.right().saturating_sub(1 + info_w);
+        let mut x = info_x + 1;
+        for (text, key) in &parts {
+            let w = text.chars().count() as u16;
+            self.hits.push(
+                Rect::new(x, preview_area.bottom().saturating_sub(1), w, 1),
+                Target::Key(KeyEvent::from(KeyCode::Char(*key))),
+            );
+            x += w + 3;
+        }
         f.render_widget(
             Paragraph::new(text).block(
                 Block::default()
@@ -606,6 +794,15 @@ impl App {
                 .block(Block::default().borders(Borders::ALL).title("Themes")),
             theme_area,
         );
+        for (name, (line, x, w)) in themes_list.iter().zip(theme_pos) {
+            let row = theme_area.y + 1 + line;
+            if row < theme_area.bottom().saturating_sub(1) {
+                self.hits.push(
+                    Rect::new(theme_area.x + 1 + x, row, w, 1),
+                    Target::Theme(name.clone()),
+                );
+            }
+        }
 
         let [list_area, settings_area] =
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -613,10 +810,16 @@ impl App {
         self.draw_segments(f, list_area);
         self.draw_settings(f, settings_area);
 
-        let mut lines: Vec<Line> = wrap_items(&help, inner_w)
-            .into_iter()
-            .map(|l| Line::styled(l, Style::new().fg(Color::Gray)))
-            .collect();
+        let help_inner = Rect::new(
+            help_area.x + 1,
+            help_area.y + 1,
+            help_area.width.saturating_sub(2),
+            help_area.height.saturating_sub(2),
+        );
+        let (mut lines, help_hits) = button_bar(&help, help_inner);
+        for (r, k) in help_hits {
+            self.hits.push(r, Target::Key(k));
+        }
         if let Some(s) = &self.status {
             lines.push(Line::styled(s.as_str(), Style::new().fg(Color::Green)));
         }
@@ -626,21 +829,34 @@ impl App {
         );
 
         let palette = self.ctx.palette;
-        match &self.popup {
-            Some(Popup::Color(p, _)) => p.draw(f, &palette),
-            Some(Popup::Icon(p)) => p.draw(f),
-            Some(Popup::Separator(p)) => p.draw(f),
+        // an open popup is modal: it takes over the whole hit map
+        let popup_hits: Option<(Rect, ClickMap)> = match &self.popup {
+            Some(Popup::Color(p, _)) => Some((centered(area, 74, 24), p.draw(f, &palette))),
+            Some(Popup::Icon(p)) => Some((centered(area, 52, 24), p.draw(f))),
+            Some(Popup::Separator(p)) => Some((centered(area, 64, 16), p.draw(f))),
             Some(Popup::Text { title, input, .. }) => {
-                let r = centered(f.area(), 50, 3);
+                let r = centered(area, 50, 4);
                 f.render_widget(Clear, r);
+                let hint = "[Enter] OK  [Esc] Cancel";
                 f.render_widget(
-                    Paragraph::new(format!("{input}█"))
-                        .block(Block::default().borders(Borders::ALL).title(title.as_str())),
+                    Paragraph::new(vec![
+                        Line::from(format!("{input}█")),
+                        Line::styled(hint, Style::new().fg(Color::Gray)),
+                    ])
+                    .block(Block::default().borders(Borders::ALL).title(title.as_str())),
                     r,
                 );
+                let row = r.y + 2;
+                Some((
+                    r,
+                    vec![
+                        (Rect::new(r.x + 1, row, 10, 1), Click::Key(KeyCode::Enter)),
+                        (Rect::new(r.x + 13, row, 14, 1), Click::Key(KeyCode::Esc)),
+                    ],
+                ))
             }
             Some(Popup::Help) => {
-                let r = centered(f.area(), 66, 22);
+                let r = centered(area, 66, 24);
                 f.render_widget(Clear, r);
                 f.render_widget(
                     Paragraph::new(HELP)
@@ -648,12 +864,23 @@ impl App {
                         .block(Block::default().borders(Borders::ALL).title("Keys")),
                     r,
                 );
+                self.hits.clear();
+                self.hits.push(area, Target::Dismiss);
+                None
             }
-            None => {}
+            None => None,
+        };
+        if let Some((rect, clicks)) = popup_hits {
+            self.hits.clear();
+            self.hits.push(area, Target::Outside);
+            self.hits.push(rect, Target::Inert);
+            for (r, c) in clicks {
+                self.hits.push(r, Target::Popup(c));
+            }
         }
     }
 
-    fn draw_segments(&self, f: &mut Frame, area: Rect) {
+    fn draw_segments(&mut self, f: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .config
             .segments
@@ -677,6 +904,7 @@ impl App {
                 ]))
             })
             .collect();
+        let n = items.len();
         let mut state = ListState::default().with_selected(Some(self.seg));
         let active = self.panel == Panel::Segments;
         f.render_stateful_widget(
@@ -687,9 +915,24 @@ impl App {
             area,
             &mut state,
         );
+        let inner = inner_rect(area);
+        // the highlight symbol takes 2 columns, then "[✓]"
+        for (i, row) in (state.offset()..n).zip(inner.y..inner.bottom()) {
+            self.hits
+                .push(Rect::new(inner.x, row, inner.width, 1), Target::Segment(i));
+            self.hits.push(
+                Rect::new(inner.x + 2, row, 3.min(inner.width.saturating_sub(2)), 1),
+                Target::SegmentCheck(i),
+            );
+        }
+        // a click on the panel's title switches to it
+        self.hits.push(
+            Rect::new(area.x, area.y, area.width, 1),
+            Target::Key(KeyEvent::from(KeyCode::Tab)).filter_panel(self.panel, Panel::Segments),
+        );
     }
 
-    fn draw_settings(&self, f: &mut Frame, area: Rect) {
+    fn draw_settings(&mut self, f: &mut Frame, area: Rect) {
         let Some(seg) = self.current() else { return };
         let palette = self.ctx.palette;
         let icon = match self.config.style.mode {
@@ -718,8 +961,9 @@ impl App {
                 Style::new().fg(if b { Color::Green } else { Color::DarkGray }),
             )]
         };
-        let mut items: Vec<ListItem> = self
-            .fields()
+        let fields = self.fields();
+        let n_fields = fields.len();
+        let mut items: Vec<ListItem> = fields
             .into_iter()
             .map(|field| match field {
                 Field::Enabled => row("Enabled", on(seg.enabled)),
@@ -765,13 +1009,23 @@ impl App {
         }
         let mut state = ListState::default().with_selected(Some(self.field));
         let active = self.panel == Panel::Settings;
+        let title = format!("{} Settings", seg.id.name());
         f.render_stateful_widget(
             List::new(items)
                 .highlight_symbol(if active { "▶ " } else { "  " })
                 .highlight_style(Style::new().add_modifier(Modifier::BOLD))
-                .block(panel_block(&format!("{} Settings", seg.id.name()), active)),
+                .block(panel_block(&title, active)),
             area,
             &mut state,
+        );
+        let inner = inner_rect(area);
+        for (i, row) in (state.offset()..n_fields).zip(inner.y..inner.bottom()) {
+            self.hits
+                .push(Rect::new(inner.x, row, inner.width, 1), Target::Field(i));
+        }
+        self.hits.push(
+            Rect::new(area.x, area.y, area.width, 1),
+            Target::Key(KeyEvent::from(KeyCode::Tab)).filter_panel(self.panel, Panel::Settings),
         );
     }
 }
@@ -787,7 +1041,57 @@ fn panel_block(title: &str, active: bool) -> Block<'static> {
         })
 }
 
-fn theme_bar(list: &[String], current: &str, width: usize) -> Vec<Line<'static>> {
+fn inner_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+impl Target {
+    /// A panel-title click switches panels only when that panel is not
+    /// already active; otherwise it does nothing.
+    fn filter_panel(self, current: Panel, own: Panel) -> Target {
+        if current == own {
+            Target::Inert
+        } else {
+            self
+        }
+    }
+}
+
+/// Theme bar lines plus each theme's (line, x, width) for click targets.
+fn theme_bar(
+    list: &[String],
+    current: &str,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<(u16, u16, u16)>) {
+    let labels: Vec<String> = list
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mark = if t == current { "[✓]" } else { "[ ]" };
+            if i < 9 {
+                format!("{} {mark} {t}", i + 1)
+            } else {
+                format!("{mark} {t}")
+            }
+        })
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|l| l.chars().count()).collect();
+    let pos = super::flow(&widths, width);
+    let lines = theme_bar_lines(list, current, width);
+    let hits = pos
+        .iter()
+        .zip(&widths)
+        .map(|(&(l, x), &w)| (l, x, w as u16))
+        .collect();
+    (lines, hits)
+}
+
+fn theme_bar_lines(list: &[String], current: &str, width: usize) -> Vec<Line<'static>> {
     let items: Vec<String> = list
         .iter()
         .enumerate()
@@ -837,27 +1141,42 @@ fn wrap_items(items: &[String], width: usize) -> Vec<String> {
     lines
 }
 
-fn help_items(panel: Panel) -> Vec<String> {
-    let mut v = vec!["[Tab] Switch Panel", "[↑↓] Navigate"];
+/// The help bar; every entry with an action is also a clickable button.
+fn help_buttons(panel: Panel) -> Vec<Button> {
+    let k = |c: char| Some(KeyEvent::from(KeyCode::Char(c)));
+    let mut v = vec![
+        button("Tab", "Switch Panel", Some(KeyEvent::from(KeyCode::Tab))),
+        button("↑↓", "Navigate", None),
+    ];
     match panel {
-        Panel::Segments => v.extend(["[Enter/Space] Show/Hide", "[Shift+↑↓] Reorder"]),
-        Panel::Settings => v.extend(["[Enter] Edit", "[←→] Toggle/Adjust"]),
+        Panel::Segments => v.extend([
+            button("Enter", "Show/Hide", Some(KeyEvent::from(KeyCode::Enter))),
+            button("K", "Move Up", k('K')),
+            button("J", "Move Down", k('J')),
+        ]),
+        Panel::Settings => v.extend([
+            button("Enter", "Edit", Some(KeyEvent::from(KeyCode::Enter))),
+            button("←→", "Toggle/Adjust", Some(KeyEvent::from(KeyCode::Right))),
+        ]),
     }
     v.extend([
-        "[1-9] Theme",
-        "[P] Next Theme",
-        "[M] Style Mode",
-        "[E] Separator",
-        "[L] Language",
-        "[C] Colors",
-        "[R] Reset",
-        "[S] Save",
-        "[W] Write Theme",
-        "[Ctrl+S] Save As Theme",
-        "[?] Help",
-        "[Esc] Quit",
+        button("P", "Next Theme", k('p')),
+        button("M", "Style Mode", k('m')),
+        button("E", "Separator", k('e')),
+        button("L", "Language", k('l')),
+        button("C", "Colors", k('c')),
+        button("R", "Reset", k('r')),
+        button("S", "Save", k('s')),
+        button("W", "Write Theme", k('w')),
+        button(
+            "Ctrl+S",
+            "Save As Theme",
+            Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        ),
+        button("?", "Help", k('?')),
+        button("Esc", "Quit", Some(KeyEvent::from(KeyCode::Esc))),
     ]);
-    v.into_iter().map(String::from).collect()
+    v
 }
 
 fn segment_help(id: SegmentId) -> &'static str {
@@ -886,6 +1205,13 @@ const HELP: &str = "\
    Enter            edit: color & icon pickers, option values
    ← →              flip switches, step numbers
 
+ Mouse
+   click            select a segment / setting / theme
+   click again      toggle the segment, or edit the setting
+   click [✓]        show / hide a segment directly
+   wheel            scroll the list under the pointer
+   bottom bar, mode/sep/lang/colors in the preview border are buttons
+
  Anywhere
    1-9 / P          pick / cycle theme      R  reset theme
    M                plain → nerd_font → powerline
@@ -894,7 +1220,7 @@ const HELP: &str = "\
    S                save config.toml        W  write current theme
    Ctrl+S           save as a new theme     Esc quit
 
- Press any key to close";
+ Press any key or click to close";
 
 fn strip_osc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -914,15 +1240,38 @@ fn strip_osc(s: &str) -> String {
 }
 
 pub fn run_configurator() -> Result<(), String> {
-    let mut terminal = ratatui::init();
+    let mut terminal = super::init();
     let result = App::new().run(&mut terminal);
-    ratatui::restore();
+    super::restore();
     result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_hits_match_drawn_text() {
+        let list: Vec<String> = themes::BUILTIN.iter().map(|(n, _)| n.to_string()).collect();
+        for width in [40, 80, 132, 200] {
+            let (lines, pos) = theme_bar(&list, "nord", width);
+            let text: Vec<String> = lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            for (name, (line, x, w)) in list.iter().zip(pos) {
+                let drawn: String = text[line as usize]
+                    .chars()
+                    .skip(x as usize)
+                    .take(w as usize)
+                    .collect();
+                assert!(
+                    drawn.ends_with(name.as_str()),
+                    "{width}: {drawn:?} vs {name}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn osc_is_stripped() {

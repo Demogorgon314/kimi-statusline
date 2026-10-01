@@ -71,7 +71,7 @@ kimi-statusline adds all of that while keeping everything the built-in footer sh
 
 ![TUI configurator](assets/configurator.png)
 
-Toggle and reorder segments, pick colors and icons, switch themes — with a live preview of your own session. Inspired by [CCometixLine](https://github.com/Haleclipse/CCometixLine).
+Toggle and reorder segments, pick colors and icons, switch themes — with a live preview of your own session. Works with the keyboard or the mouse: click to select, click again to toggle or edit, scroll to move. Inspired by [CCometixLine](https://github.com/Haleclipse/CCometixLine).
 
 ## Fast by design
 

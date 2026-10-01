@@ -71,7 +71,7 @@ Kimi Code 自带的底栏只告诉你模型和目录，但不告诉你：
 
 ![TUI 配置器](assets/configurator.png)
 
-开关和排序各个段、选颜色和图标、切换主题，用你自己会话的数据实时预览。设计参考 [CCometixLine](https://github.com/Haleclipse/CCometixLine)。
+开关和排序各个段、选颜色和图标、切换主题，用你自己会话的数据实时预览。键盘和鼠标都能操作：单击选中，再点一次切换或编辑，滚轮上下移动。设计参考 [CCometixLine](https://github.com/Haleclipse/CCometixLine)。
 
 ## 为速度而生
 

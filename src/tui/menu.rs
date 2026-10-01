@@ -1,7 +1,8 @@
+use super::{button, button_bar, Hits};
 use crate::config::{config_path, Config};
 use crate::{install, quota, themes};
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Layout};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -13,11 +14,32 @@ pub enum Action {
     Configure,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+enum Target {
+    Item(usize),
+    Key(KeyEvent),
+}
+
 pub struct Menu {
     selected: usize,
     status: Option<(String, bool)>,
     about: bool,
+    hits: Hits<Target>,
+}
+
+impl Default for Menu {
+    fn default() -> Self {
+        Menu {
+            selected: 0,
+            status: None,
+            about: false,
+            hits: Hits::new(),
+        }
+    }
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 const ITEMS: [(&str, &str); 8] = [
@@ -65,6 +87,30 @@ impl Menu {
             _ => {}
         }
         Action::Stay
+    }
+
+    /// None when the event changes nothing (no redraw needed).
+    pub fn mouse(&mut self, m: MouseEvent) -> Option<Action> {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {}
+            MouseEventKind::ScrollUp => return Some(self.key(key(KeyCode::Up))),
+            MouseEventKind::ScrollDown => return Some(self.key(key(KeyCode::Down))),
+            _ => return None,
+        }
+        if self.about {
+            self.about = false;
+            return Some(Action::Stay);
+        }
+        match self.hits.at(m.column, m.row)? {
+            // first click selects, a click on the selected item runs it
+            Target::Item(i) if i == self.selected => Some(self.key(key(KeyCode::Enter))),
+            Target::Item(i) => {
+                self.selected = i;
+                self.status = None;
+                Some(Action::Stay)
+            }
+            Target::Key(k) => Some(self.key(k)),
+        }
     }
 
     fn select(&mut self) -> Action {
@@ -123,7 +169,19 @@ impl Menu {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        let footer = if self.status.is_some() { 4 } else { 3 };
+        self.hits.clear();
+        let buttons = [
+            button("↑↓", "Navigate", None),
+            button("Enter", "Select", Some(key(KeyCode::Enter))),
+            button("Esc", "Exit", Some(key(KeyCode::Esc))),
+            button("Click", "select, click again to run", None),
+        ];
+        let inner_w = f.area().width.saturating_sub(2);
+        let bar_rows = button_bar(&buttons, Rect::new(0, 0, inner_w, u16::MAX))
+            .0
+            .len() as u16;
+        // reserve the status row up front so buttons never shift under the pointer
+        let footer = bar_rows + 3;
         let [header, body, foot] = Layout::vertical([
             Constraint::Length(5),
             Constraint::Min(10),
@@ -174,21 +232,39 @@ impl Menu {
             body,
             &mut state,
         );
+        let inner = Rect::new(
+            body.x + 1,
+            body.y + 1,
+            body.width.saturating_sub(2),
+            body.height.saturating_sub(2),
+        );
+        let offset = state.offset();
+        for (i, row) in (offset..ITEMS.len()).zip(inner.y..inner.bottom()) {
+            self.hits
+                .push(Rect::new(inner.x, row, inner.width, 1), Target::Item(i));
+        }
 
-        let mut lines = vec![Line::styled(
-            "[↑↓] Navigate  [Enter] Select  [Esc] Exit",
-            Style::new().fg(Color::Gray),
-        )];
+        let foot_inner = Rect::new(
+            foot.x + 1,
+            foot.y + 1,
+            foot.width.saturating_sub(2),
+            bar_rows,
+        );
+        let (bar, bar_hits) = button_bar(&buttons, foot_inner);
+        for (r, k) in bar_hits {
+            self.hits.push(r, Target::Key(k));
+        }
+        let mut lines = bar;
         if let Some((msg, is_err)) = &self.status {
             lines.push(Line::styled(
                 msg.as_str(),
                 Style::new().fg(if *is_err { Color::Red } else { Color::Green }),
             ));
         }
+        // no wrapping: the button bar is laid out by button_bar() already,
+        // and the hit boxes must match what is drawn
         f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
             foot,
         );
 
@@ -207,7 +283,10 @@ impl Menu {
                     Line::from(""),
                     Line::from(format!("Config: {}", config_path().display())),
                     Line::from(""),
-                    Line::styled("Press any key to close", Style::new().fg(Color::Gray)),
+                    Line::styled(
+                        "Press any key or click to close",
+                        Style::new().fg(Color::Gray),
+                    ),
                 ])
                 .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title("About")),

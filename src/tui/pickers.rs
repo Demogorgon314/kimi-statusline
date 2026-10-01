@@ -38,6 +38,43 @@ pub enum Outcome<T> {
     Done(T),
 }
 
+/// What a mouse click inside a popup means. Clicking an option selects it;
+/// clicking the already-selected option chooses it, like Enter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Click {
+    /// select option `i` (choose it if already selected)
+    Option(usize),
+    /// a tab/mode switch, by index
+    Tab(usize),
+    /// a footer button that acts like this key
+    Key(KeyCode),
+}
+
+/// Clickable rectangles a popup drew this frame.
+pub type ClickMap = Vec<(Rect, Click)>;
+
+fn inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn footer_button(line: &str, label: &str, key: KeyCode, at: Rect, hits: &mut ClickMap) {
+    if let Some(x) = line.find(label) {
+        let x = line[..x].chars().count() as u16;
+        let w = label.chars().count() as u16;
+        if x < at.width {
+            hits.push((
+                Rect::new(at.x + x, at.y, w.min(at.width - x), 1),
+                Click::Key(key),
+            ));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // color picker
 // ---------------------------------------------------------------------------
@@ -136,6 +173,30 @@ impl ColorPicker {
         })
     }
 
+    pub fn click(&mut self, c: Click) -> Outcome<Option<AnsiColor>> {
+        match c {
+            Click::Tab(i) => {
+                let mode = [
+                    ColorMode::Palette,
+                    ColorMode::Basic16,
+                    ColorMode::Extended256,
+                    ColorMode::Rgb,
+                ][i.min(3)];
+                if mode != self.mode {
+                    self.mode = mode;
+                    self.sel = 0;
+                }
+                Outcome::Pending
+            }
+            Click::Option(i) if i == self.sel => self.key(KeyEvent::from(KeyCode::Enter)),
+            Click::Option(i) => {
+                self.sel = i.min(self.len().saturating_sub(1));
+                Outcome::Pending
+            }
+            Click::Key(k) => self.key(KeyEvent::from(k)),
+        }
+    }
+
     pub fn key(&mut self, k: KeyEvent) -> Outcome<Option<AnsiColor>> {
         let (len, cols) = (self.len(), self.cols());
         match k.code {
@@ -174,9 +235,23 @@ impl ColorPicker {
         Outcome::Pending
     }
 
-    pub fn draw(&self, f: &mut Frame, palette: &Palette) {
+    pub fn draw(&self, f: &mut Frame, palette: &Palette) -> ClickMap {
         let area = centered(f.area(), 74, 24);
         f.render_widget(Clear, area);
+        let body = inner(area);
+        let mut hits: ClickMap = Vec::new();
+        // tabs on the first line: " Kimi palette " " 16 colors " …
+        let mut x = body.x;
+        for (i, name) in ["Kimi palette", "16 colors", "256 colors", "RGB"]
+            .iter()
+            .enumerate()
+        {
+            let w = name.chars().count() as u16 + 2;
+            hits.push((Rect::new(x, body.y, w, 1), Click::Tab(i)));
+            x += w + 1;
+        }
+        // options start on the third line
+        let top = body.y + 2;
         let tab = |m: ColorMode, name: &str| {
             let style = if self.mode == m {
                 Style::new().bg(Color::Cyan).fg(Color::Black)
@@ -206,6 +281,9 @@ impl ColorPicker {
         };
         match self.mode {
             ColorMode::Palette => {
+                for i in 0..=TOKENS.len() {
+                    hits.push((Rect::new(body.x, top + i as u16, 24, 1), Click::Option(i)));
+                }
                 lines.push(Line::from(cell(0, Color::Gray, " ∅ none (inherit)".into())));
                 for (i, t) in TOKENS.iter().enumerate() {
                     let c = palette
@@ -219,6 +297,12 @@ impl ColorPicker {
                 ));
             }
             ColorMode::Basic16 => {
+                for i in 0..16u16 {
+                    hits.push((
+                        Rect::new(body.x + (i % 4) * 19, top + i / 4, 19, 1),
+                        Click::Option(i as usize),
+                    ));
+                }
                 for row in 0..4 {
                     let spans = (0..4)
                         .map(|col| {
@@ -234,6 +318,12 @@ impl ColorPicker {
                 }
             }
             ColorMode::Extended256 => {
+                for i in 0..256u16 {
+                    hits.push((
+                        Rect::new(body.x + (i % 16) * 3, top + i / 16, 3, 1),
+                        Click::Option(i as usize),
+                    ));
+                }
                 for row in 0..16 {
                     let spans = (0..16)
                         .map(|col| {
@@ -261,10 +351,14 @@ impl ColorPicker {
             }
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled(
-            "[Tab] Mode  [←↑↓→] Navigate  [Enter] Select  [Esc] Cancel",
-            Style::new().fg(Color::Gray),
-        ));
+        let help = "[Tab] Mode  [←↑↓→] Navigate  [Enter] Select  [Esc] Cancel";
+        let help_row = body.y + lines.len() as u16;
+        lines.push(Line::styled(help, Style::new().fg(Color::Gray)));
+        if help_row < body.bottom() {
+            let at = Rect::new(body.x, help_row, body.width, 1);
+            footer_button(help, "[Enter] Select", KeyCode::Enter, at, &mut hits);
+            footer_button(help, "[Esc] Cancel", KeyCode::Esc, at, &mut hits);
+        }
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
@@ -273,6 +367,8 @@ impl ColorPicker {
             ),
             area,
         );
+        hits.retain(|(r, _)| r.y < body.bottom());
+        hits
     }
 }
 
@@ -350,6 +446,8 @@ pub struct IconPicker {
     pub nerd: bool,
     sel: usize,
     custom: Option<String>,
+    /// list scroll position from the last draw, for mapping clicks
+    offset: std::cell::Cell<usize>,
 }
 
 impl IconPicker {
@@ -358,6 +456,7 @@ impl IconPicker {
             nerd,
             sel: 0,
             custom: None,
+            offset: std::cell::Cell::new(0),
         }
     }
 
@@ -366,6 +465,31 @@ impl IconPicker {
             &NERD_ICONS
         } else {
             &PLAIN_ICONS
+        }
+    }
+
+    pub fn click(&mut self, c: Click) -> Outcome<(bool, String)> {
+        match c {
+            Click::Option(i) if i == self.sel && self.custom.is_none() => {
+                self.key(KeyEvent::from(KeyCode::Enter))
+            }
+            Click::Option(i) => {
+                self.custom = None;
+                self.sel = i.min(self.icons().len());
+                Outcome::Pending
+            }
+            Click::Tab(_) => self.key(KeyEvent::from(KeyCode::Tab)),
+            Click::Key(k) => self.key(KeyEvent::from(k)),
+        }
+    }
+
+    pub fn scroll(&mut self, down: bool) {
+        if self.custom.is_none() {
+            let _ = self.key(KeyEvent::from(if down {
+                KeyCode::Down
+            } else {
+                KeyCode::Up
+            }));
         }
     }
 
@@ -407,9 +531,10 @@ impl IconPicker {
         Outcome::Pending
     }
 
-    pub fn draw(&self, f: &mut Frame) {
+    pub fn draw(&self, f: &mut Frame) -> ClickMap {
         let area = centered(f.area(), 52, 24);
         f.render_widget(Clear, area);
+        let mut hits: ClickMap = Vec::new();
         let title = if self.nerd {
             "Icon — Nerd Font"
         } else {
@@ -423,7 +548,10 @@ impl IconPicker {
                 .iter()
                 .map(|(i, name)| ListItem::new(format!("  {i}   {name}"))),
         );
-        let mut state = ListState::default().with_selected(Some(self.sel));
+        let n = items.len();
+        let mut state = ListState::default()
+            .with_selected(Some(self.sel))
+            .with_offset(self.offset.get());
         f.render_stateful_widget(
             List::new(items)
                 .highlight_style(Style::new().bg(Color::Cyan).fg(Color::Black))
@@ -431,14 +559,37 @@ impl IconPicker {
             list_area,
             &mut state,
         );
+        self.offset.set(state.offset());
+        let list_inner = inner(list_area);
+        for (i, row) in (state.offset()..n).zip(list_inner.y..list_inner.bottom()) {
+            hits.push((
+                Rect::new(list_inner.x, row, list_inner.width, 1),
+                Click::Option(i),
+            ));
+        }
+        // the title doubles as the Plain / Nerd Font toggle
+        hits.push((
+            Rect::new(list_area.x, list_area.y, list_area.width, 1),
+            Click::Tab(0),
+        ));
         let text = match &self.custom {
             Some(input) => format!("Custom: {input}█   [Enter] Apply [Esc] Back"),
             None => "[↑↓] Navigate  [Tab] Plain/Nerd  [C] Custom  [Enter] Select".into(),
         };
+        let at = Rect::new(help.x + 1, help.y + 1, help.width.saturating_sub(2), 1);
+        if self.custom.is_some() {
+            footer_button(&text, "[Enter] Apply", KeyCode::Enter, at, &mut hits);
+            footer_button(&text, "[Esc] Back", KeyCode::Esc, at, &mut hits);
+        } else {
+            footer_button(&text, "[Tab] Plain/Nerd", KeyCode::Tab, at, &mut hits);
+            footer_button(&text, "[C] Custom", KeyCode::Char('c'), at, &mut hits);
+            footer_button(&text, "[Enter] Select", KeyCode::Enter, at, &mut hits);
+        }
         f.render_widget(
             Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
             help,
         );
+        hits
     }
 }
 
@@ -478,6 +629,22 @@ impl SeparatorEditor {
         }
     }
 
+    pub fn click(&mut self, c: Click) -> Outcome<String> {
+        match c {
+            Click::Option(i) if self.sel == Some(i) => self.key(KeyEvent::from(KeyCode::Enter)),
+            Click::Option(i) => {
+                self.sel = Some(i.min(SEPARATORS.len() - 1));
+                Outcome::Pending
+            }
+            Click::Tab(_) => {
+                // the custom line: switch to typing
+                self.sel = None;
+                Outcome::Pending
+            }
+            Click::Key(k) => self.key(KeyEvent::from(k)),
+        }
+    }
+
     pub fn key(&mut self, k: KeyEvent) -> Outcome<String> {
         let n = SEPARATORS.len();
         match k.code {
@@ -506,9 +673,20 @@ impl SeparatorEditor {
         Outcome::Pending
     }
 
-    pub fn draw(&self, f: &mut Frame) {
+    pub fn draw(&self, f: &mut Frame) -> ClickMap {
         let area = centered(f.area(), 64, 16);
         f.render_widget(Clear, area);
+        let body = inner(area);
+        let mut hits: ClickMap = (0..SEPARATORS.len())
+            .map(|i| {
+                (
+                    Rect::new(body.x, body.y + i as u16, body.width, 1),
+                    Click::Option(i),
+                )
+            })
+            .collect();
+        let custom_row = body.y + SEPARATORS.len() as u16 + 1;
+        hits.push((Rect::new(body.x, custom_row, body.width, 1), Click::Tab(0)));
         let mut lines: Vec<Line> = SEPARATORS
             .iter()
             .enumerate()
@@ -523,13 +701,16 @@ impl SeparatorEditor {
             .collect();
         lines.push(Line::from(""));
         lines.push(Line::from(format!(" Custom: {}█", self.input)));
-        lines.push(Line::styled(
-            " [↑↓] Presets  type for custom  [Tab] Clear  [Enter] Apply",
-            Style::new().fg(Color::Gray),
-        ));
+        let help = " [↑↓] Presets  type for custom  [Tab] Clear  [Enter] Apply";
+        lines.push(Line::styled(help, Style::new().fg(Color::Gray)));
+        let at = Rect::new(body.x, custom_row + 1, body.width, 1);
+        footer_button(help, "[Tab] Clear", KeyCode::Tab, at, &mut hits);
+        footer_button(help, "[Enter] Apply", KeyCode::Enter, at, &mut hits);
         f.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Separator")),
             area,
         );
+        hits.retain(|(r, _)| r.y < body.bottom());
+        hits
     }
 }
