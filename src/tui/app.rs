@@ -1294,7 +1294,7 @@ fn segment_help(id: SegmentId) -> &'static str {
         SegmentId::Usage => "Whole-session input ↑, output ↓ and cache hit rate.",
         SegmentId::Subagent => "Usage of the heaviest sub-agent model.",
         SegmentId::Session => "Time since the session was created.",
-        SegmentId::Tps => "Decode speed of the latest model call (main agent or sub-agent): output tokens over streaming time, as measured by Kimi Code; time to first token is excluded. While several agents stream at once, ×N shows their combined rate over window_secs. avg is token-weighted over the session. Hidden after stale_secs idle.",
+        SegmentId::Tps => "Decode speed of the latest model call (main agent or sub-agent): output tokens over streaming time, as measured by Kimi Code; time to first token is excluded. While several agents stream at once, ×N shows their combined rate over window_secs. avg is token-weighted over the session. Stays on screen when idle, dimmed after stale_secs (hide_when_stale removes it instead).",
         SegmentId::Quota => "Plan quota: 5h / 7d (and monthly) used % with reset time. Needs a Kimi Code OAuth login; refreshed in the background every refresh_secs.",
     }
 }

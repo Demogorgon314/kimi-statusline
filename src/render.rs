@@ -569,14 +569,16 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
 
 /// `33.1 tok/s · ×3 96 tok/s (avg 31.4)`: the latest call's decode speed
 /// (any agent); while several agents are streaming at once, their combined
-/// throughput and count; and the session's token-weighted average. Hidden once
-/// the last call is older than `stale_secs`, so an idle session doesn't
-/// keep showing an old number.
+/// throughput and count; and the session's token-weighted average. An idle
+/// session keeps the last measurement on screen, dimmed once it is older
+/// than `stale_secs` so it doesn't read as live; `hide_when_stale` drops it
+/// instead.
 fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
     let speed = &ctx.stats.as_ref()?.speed;
     let last = speed.last()?;
-    let stale = seg.opt_int("stale_secs", 300);
-    if stale > 0 && ctx.now - last.end / 1000.0 > stale as f64 {
+    let stale_after = seg.opt_int("stale_secs", 300);
+    let stale = stale_after > 0 && ctx.now - last.end / 1000.0 > stale_after as f64;
+    if stale && seg.opt_bool("hide_when_stale", false) {
         return None;
     }
     let fmt = |v: f64| {
@@ -605,6 +607,11 @@ fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span
                 format!(" ({label} {})", fmt(avg)),
                 token("text_muted"),
             ));
+        }
+    }
+    if stale {
+        for span in &mut spans {
+            span.color = Some(token("text_muted"));
         }
     }
     Some(spans)
@@ -921,6 +928,65 @@ fn truncate(s: &str, width: usize, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tps_ctx(age_secs: f64, hide_when_stale: bool) -> (Ctx, SegmentConfig) {
+        let mut config = crate::themes::get("kimi");
+        let seg = config
+            .segments
+            .iter_mut()
+            .find(|s| s.id == SegmentId::Tps)
+            .unwrap();
+        seg.enabled = true;
+        seg.options
+            .insert("hide_when_stale".into(), hide_when_stale.into());
+        let seg = seg.clone();
+        let now = 1_000_000.0;
+        let mut stats = SessionStats::default();
+        stats.speed.recent.push(crate::session::Call {
+            agent: "main".into(),
+            start: (now - age_secs - 10.0) * 1000.0,
+            end: (now - age_secs) * 1000.0,
+            output: 420,
+            ttft: 0.0,
+        });
+        let ctx = Ctx {
+            payload: Payload::default(),
+            config,
+            palette: crate::kimi_config::DARK,
+            models: Models::default(),
+            stats: Some(stats),
+            effort: None,
+            goal: None,
+            goal_seen_at: None,
+            session_created: None,
+            tasks: (0, 0),
+            git: None,
+            pr: None,
+            dance: None,
+            quota: None,
+            now,
+            color: true,
+        };
+        (ctx, seg)
+    }
+
+    #[test]
+    fn idle_tps_stays_visible_but_dimmed() {
+        let muted = Some(token("text_muted"));
+        // fresh: the rate is not dimmed
+        let (ctx, seg) = tps_ctx(10.0, false);
+        let spans = tps_segment(&ctx, &seg, false).unwrap();
+        assert_eq!(spans[0].text, "42.0 tok/s");
+        assert_ne!(spans[0].color, muted);
+        // idle past stale_secs (300): still shown, every span dimmed
+        let (ctx, seg) = tps_ctx(3600.0, false);
+        let spans = tps_segment(&ctx, &seg, false).unwrap();
+        assert_eq!(spans[0].text, "42.0 tok/s");
+        assert!(spans.iter().all(|s| s.color == muted));
+        // hide_when_stale restores the old behavior
+        let (ctx, seg) = tps_ctx(3600.0, true);
+        assert!(tps_segment(&ctx, &seg, false).is_none());
+    }
 
     #[test]
     fn tokens_and_rates() {

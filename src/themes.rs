@@ -91,6 +91,7 @@ fn default_options(id: SegmentId) -> BTreeMap<String, toml::Value> {
             put("show_parallel", true.into());
             put("window_secs", 30.into());
             put("stale_secs", 300.into());
+            put("hide_when_stale", false.into());
         }
         _ => {}
     }
