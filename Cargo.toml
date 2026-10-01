@@ -1,0 +1,38 @@
+[package]
+name = "kimi-statusline"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance status line for Kimi Code CLI, written in Rust"
+license = "MIT"
+repository = "https://github.com/Demogorgon314/kimi-statusline"
+readme = "README.md"
+keywords = ["kimi", "statusline", "kimi-code", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "kimi-statusline"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+unicode-width = "0.2"
+md5 = "0.7"
+ratatui = "0.30"
+crossterm = "0.29"
+ansi-to-tui = "8"
+ureq = { version = "3", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

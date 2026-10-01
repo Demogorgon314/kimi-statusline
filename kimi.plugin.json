@@ -1,0 +1,28 @@
+{
+  "name": "kimi-statusline",
+  "version": "0.1.0",
+  "description": "High-performance status line for Kimi Code: session token usage, cache hit rate, 5h/7d quota, sub-agents, git + PR, themes (Rust)",
+  "license": "MIT",
+  "keywords": [
+    "statusline",
+    "usage",
+    "tokens",
+    "theme"
+  ],
+  "interface": {
+    "displayName": "Kimi Statusline",
+    "shortDescription": "Token usage, cache hit rate, git/PR and themes in the TUI footer",
+    "longDescription": "Replaces the footer's first line with a configurable, themeable status line written in Rust. Shows whole-session input/output tokens and cache hit rate, the heaviest sub-agent model, mode/goal/task badges, git diff stats and the open PR. Configure with `kimi-statusline config` in a terminal.",
+    "websiteURL": "https://github.com/Demogorgon314/kimi-statusline",
+    "developerName": "Demogorgon314"
+  },
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "sh ./scripts/setup.sh || scripts\\setup.cmd",
+      "timeout": 30
+    }
+  ],
+  "homepage": "https://github.com/Demogorgon314/kimi-statusline",
+  "author": "Demogorgon314"
+}

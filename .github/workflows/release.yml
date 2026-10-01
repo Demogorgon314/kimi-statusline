@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, name: darwin-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: darwin-x64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x64 }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, name: windows-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          set -e
+          out="target/${{ matrix.target }}/release"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            (cd "$out" && 7z a "$GITHUB_WORKSPACE/kimi-statusline-${{ matrix.name }}.zip" kimi-statusline.exe)
+          else
+            tar -czf "kimi-statusline-${{ matrix.name }}.tar.gz" -C "$out" kimi-statusline
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: kimi-statusline-${{ matrix.name }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: plugin version matches tag
+        run: |
+          v=$(jq -r .version kimi.plugin.json)
+          c=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] && [ "v$c" = "$GITHUB_REF_NAME" ] || {
+            echo "tag $GITHUB_REF_NAME vs kimi.plugin.json $v / Cargo.toml $c"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
