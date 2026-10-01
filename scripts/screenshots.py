@@ -229,7 +229,7 @@ def main():
     os.makedirs(ASSETS, exist_ok=True)
     home = setup_home()
     try:
-        hero = ansi_to_html(render(home, "kimi", 205), "#e0e0e0")
+        hero = ansi_to_html(render(home, "nord", 205), "#e0e0e0")
         shoot(page(kimi_footer(hero), "kimi — ~/code/kimi-statusline", minw=1180), "hero.png", 2400)
 
         rows = []
