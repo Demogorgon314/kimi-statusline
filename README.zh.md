@@ -107,6 +107,8 @@ Kimi Code 每秒运行一次状态栏，超过 300ms 就杀掉。kimi-statusline
 
 空间不够时按这个顺序去掉：session → tps → git → directory → subagent → tasks → goal → context → quota → mode。
 
+TPS 和用量只属于当前会话：新会话从空状态开始，恢复会话时保留原统计。5h / 7d 额度属于账号，会跨会话保留。预览和配置器使用当前目录的最近会话。
+
 </details>
 
 <details>

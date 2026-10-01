@@ -107,6 +107,8 @@ Kimi Code runs the status line every second and kills it after 300 ms. kimi-stat
 
 When space runs out, segments drop in this order: session → tps → git → directory → subagent → tasks → goal → context → quota → mode.
 
+TPS and usage belong to the current session: a fresh session starts empty, while resuming restores its statistics. The 5h / 7d quota belongs to your account and carries across sessions. Preview and the configurator use the latest session in the working directory.
+
 </details>
 
 <details>

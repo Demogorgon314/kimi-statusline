@@ -19,7 +19,7 @@ pub fn collect(payload: Payload, config: Config, started: Instant) -> Ctx {
     let now = paths::now_secs();
     let wants = |id: SegmentId| config.segment(id).is_some_and(|s| s.enabled);
 
-    let session_dir = session::find_session_dir(&payload.session_id, &payload.cwd);
+    let session_dir = session::find_session_dir(&payload.session_id);
     paths::debug(&format!(
         "session={:?} dir={session_dir:?}",
         payload.session_id
@@ -29,11 +29,9 @@ pub fn collect(payload: Payload, config: Config, started: Instant) -> Ctx {
     let mut goal = None;
     let mut session_created = None;
     if let Some(dir) = &session_dir {
-        let cache_key = if payload.session_id.is_empty() {
-            dir.to_string_lossy().into_owned()
-        } else {
-            payload.session_id.clone()
-        };
+        // Bind stats to the resolved directory. Older versions could cache
+        // the latest session's stats under an unresolved, different ID.
+        let cache_key = dir.to_string_lossy().into_owned();
         let prior = session::load_cache(&cache_key);
         let mut st = session::parse_session(dir, prior.clone());
 
@@ -131,7 +129,12 @@ pub fn sample_payload(cwd: &str, session_id: Option<String>) -> Payload {
     )
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty());
-    if let Some(dir) = session::find_session_dir(&p.session_id, cwd) {
+    let dir = if p.session_id.is_empty() {
+        session::latest_session_dir(cwd)
+    } else {
+        session::find_session_dir(&p.session_id)
+    };
+    if let Some(dir) = dir {
         if let Some(model) = last_model(&dir) {
             p.model = model;
         }

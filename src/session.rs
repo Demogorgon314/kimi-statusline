@@ -241,40 +241,48 @@ pub struct SessionStats {
 // session resolution
 // ---------------------------------------------------------------------------
 
-pub fn find_session_dir(session_id: &str, cwd: &str) -> Option<PathBuf> {
-    if session_id.is_empty() && cwd.is_empty() {
+/// Resolve only the requested session. Startup can have an empty ID or an
+/// ID whose directory has not been created yet; neither means "resume latest".
+pub fn find_session_dir(session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
         return None;
     }
     let home = paths::kimi_home();
-    if !session_id.is_empty() {
-        if let Ok(f) = File::open(home.join("session_index.jsonl")) {
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                if !line.contains(session_id) {
-                    continue;
-                }
-                let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    continue;
-                };
-                if rec.get("sessionId").and_then(|v| v.as_str()) == Some(session_id) {
-                    if let Some(dir) = rec.get("sessionDir").and_then(|v| v.as_str()) {
-                        let dir = PathBuf::from(dir);
-                        if dir.is_dir() {
-                            return Some(dir);
-                        }
+    if let Ok(f) = File::open(home.join("session_index.jsonl")) {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
+            if !line.contains(session_id) {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if rec.get("sessionId").and_then(|v| v.as_str()) == Some(session_id) {
+                if let Some(dir) = rec.get("sessionDir").and_then(|v| v.as_str()) {
+                    let dir = PathBuf::from(dir);
+                    if dir.is_dir() {
+                        return Some(dir);
                     }
                 }
             }
         }
-        for name in [session_id.to_string(), format!("session_{session_id}")] {
-            for wd in read_dirs(&home.join("sessions")) {
-                let candidate = wd.join(&name);
-                if candidate.is_dir() {
-                    return Some(candidate);
-                }
+    }
+    for name in [session_id.to_string(), format!("session_{session_id}")] {
+        for wd in read_dirs(&home.join("sessions")) {
+            let candidate = wd.join(&name);
+            if candidate.is_dir() {
+                return Some(candidate);
             }
         }
     }
-    // fallback: newest session whose recorded cwd matches
+    None
+}
+
+/// Select a recent session explicitly for the preview/configurator.
+pub fn latest_session_dir(cwd: &str) -> Option<PathBuf> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let home = paths::kimi_home();
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for wd in read_dirs(&home.join("sessions")) {
         for session in read_dirs(&wd) {
@@ -284,16 +292,14 @@ pub fn find_session_dir(session_id: &str, cwd: &str) -> Option<PathBuf> {
             if best.as_ref().is_some_and(|(t, _)| *t >= mtime) {
                 continue;
             }
-            if !cwd.is_empty() {
-                let Some(v) = read_json(&state) else { continue };
-                let rec_cwd = v
-                    .get("cwd")
-                    .or_else(|| v.get("workDir"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                if !same_path(rec_cwd, cwd) {
-                    continue;
-                }
+            let Some(v) = read_json(&state) else { continue };
+            let rec_cwd = v
+                .get("cwd")
+                .or_else(|| v.get("workDir"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if !same_path(rec_cwd, cwd) {
+                continue;
             }
             best = Some((mtime, session));
         }
