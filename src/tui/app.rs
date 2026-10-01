@@ -87,6 +87,22 @@ pub struct App {
     confirm_quit: bool,
     quit: bool,
     hits: Hits<Target>,
+    /// segment list geometry from the last draw: (inner rect, scroll offset)
+    seg_list: Option<(Rect, usize)>,
+    /// left button held on a segment row
+    press: Option<Press>,
+}
+
+/// A left-button press on a segment row, which becomes a drag once the
+/// pointer leaves the row it started on.
+struct Press {
+    /// the segment, by its current index (follows it while dragging)
+    index: usize,
+    /// it was already selected when pressed: releasing without a drag
+    /// toggles it, like a second click
+    was_selected: bool,
+    start_row: u16,
+    dragging: bool,
 }
 
 /// Plausible numbers for whatever the current directory's session lacks, so
@@ -172,6 +188,8 @@ impl App {
             confirm_quit: false,
             quit: false,
             hits: Hits::new(),
+            seg_list: None,
+            press: None,
         }
     }
 
@@ -261,10 +279,13 @@ impl App {
     fn mouse(&mut self, m: MouseEvent) -> bool {
         let scroll = match m.kind {
             MouseEventKind::Down(MouseButton::Left) => None,
+            MouseEventKind::Drag(MouseButton::Left) => return self.drag(m.row),
+            MouseEventKind::Up(MouseButton::Left) => return self.release(),
             MouseEventKind::ScrollUp => Some(false),
             MouseEventKind::ScrollDown => Some(true),
             _ => return false,
         };
+        self.press = None;
         if let Some(down) = scroll {
             return self.scroll(down, m.column, m.row);
         }
@@ -278,13 +299,20 @@ impl App {
         }
         match target {
             Target::Segment(i) => {
-                if self.panel == Panel::Segments && self.seg == i {
-                    self.toggle_segment();
-                } else {
-                    self.panel = Panel::Segments;
-                    self.seg = i;
+                // select now; toggling (on a second click) or reordering
+                // (on a drag) is decided when the button comes up
+                let was_selected = self.panel == Panel::Segments && self.seg == i;
+                self.panel = Panel::Segments;
+                self.seg = i;
+                if !was_selected {
                     self.field = 0;
                 }
+                self.press = Some(Press {
+                    index: i,
+                    was_selected,
+                    start_row: m.row,
+                    dragging: false,
+                });
             }
             Target::SegmentCheck(i) => {
                 self.panel = Panel::Segments;
@@ -309,6 +337,60 @@ impl App {
                 }
             }
             Target::Inert => {}
+        }
+        true
+    }
+
+    /// Segment index under a screen row of the segment list, clamped to the
+    /// visible rows so dragging past either end parks it at that end.
+    fn segment_at_row(&self, row: u16) -> Option<usize> {
+        let (inner, offset) = self.seg_list?;
+        let n = self.config.segments.len();
+        if n == 0 || inner.height == 0 {
+            return None;
+        }
+        let last_row = inner.y + (inner.height.min((n - offset) as u16)) - 1;
+        let row = row.clamp(inner.y, last_row);
+        Some((offset + (row - inner.y) as usize).min(n - 1))
+    }
+
+    /// Drag a pressed segment: it moves live, so the preview shows the new
+    /// order while the button is still held.
+    fn drag(&mut self, row: u16) -> bool {
+        let Some(press) = &self.press else {
+            return false;
+        };
+        if !press.dragging && row == press.start_row {
+            return false;
+        }
+        let from = press.index;
+        let Some(to) = self.segment_at_row(row) else {
+            return false;
+        };
+        let press = self.press.as_mut().expect("press");
+        press.dragging = true;
+        if to != from {
+            let seg = self.config.segments.remove(from);
+            self.config.segments.insert(to, seg);
+            press.index = to;
+            self.seg = to;
+        }
+        true
+    }
+
+    fn release(&mut self) -> bool {
+        let Some(press) = self.press.take() else {
+            return false;
+        };
+        if press.dragging {
+            let name = self.config.segments[press.index].id.name();
+            self.status = Some(format!(
+                "Moved {name} to position {} of {}",
+                press.index + 1,
+                self.config.segments.len()
+            ));
+        } else if press.was_selected {
+            self.toggle_segment();
         }
         true
     }
@@ -907,15 +989,35 @@ impl App {
         let n = items.len();
         let mut state = ListState::default().with_selected(Some(self.seg));
         let active = self.panel == Panel::Segments;
+        let dragging = self.press.as_ref().is_some_and(|p| p.dragging);
+        let (symbol, highlight) = if dragging {
+            (
+                "⇕ ",
+                Style::new()
+                    .bg(Color::Rgb(40, 60, 90))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if active {
+            ("▶ ", Style::new().add_modifier(Modifier::BOLD))
+        } else {
+            ("  ", Style::new().add_modifier(Modifier::BOLD))
+        };
+        let mut block = panel_block("Segments", active);
+        if active {
+            block = block.title_bottom(
+                Line::styled(" drag to reorder ", Style::new().fg(Color::DarkGray)).right_aligned(),
+            );
+        }
         f.render_stateful_widget(
             List::new(items)
-                .highlight_symbol(if active { "▶ " } else { "  " })
-                .highlight_style(Style::new().add_modifier(Modifier::BOLD))
-                .block(panel_block("Segments", active)),
+                .highlight_symbol(symbol)
+                .highlight_style(highlight)
+                .block(block),
             area,
             &mut state,
         );
         let inner = inner_rect(area);
+        self.seg_list = Some((inner, state.offset()));
         // the highlight symbol takes 2 columns, then "[✓]"
         for (i, row) in (state.offset()..n).zip(inner.y..inner.bottom()) {
             self.hits
@@ -1153,6 +1255,7 @@ fn help_buttons(panel: Panel) -> Vec<Button> {
             button("Enter", "Show/Hide", Some(KeyEvent::from(KeyCode::Enter))),
             button("K", "Move Up", k('K')),
             button("J", "Move Down", k('J')),
+            button("Drag", "Reorder", None),
         ]),
         Panel::Settings => v.extend([
             button("Enter", "Edit", Some(KeyEvent::from(KeyCode::Enter))),
@@ -1209,6 +1312,7 @@ const HELP: &str = "\
    click            select a segment / setting / theme
    click again      toggle the segment, or edit the setting
    click [✓]        show / hide a segment directly
+   drag a segment   move it to a new position (live preview)
    wheel            scroll the list under the pointer
    bottom bar, mode/sep/lang/colors in the preview border are buttons
 
