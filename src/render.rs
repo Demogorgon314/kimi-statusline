@@ -461,6 +461,7 @@ fn segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
             Some(spans)
         }
         SegmentId::Quota => quota_segment(ctx, seg, compact),
+        SegmentId::Tps => tps_segment(ctx, seg, compact),
         SegmentId::Session => {
             let created = ctx.session_created?;
             let secs = (ctx.now - created).max(0.0) as u64;
@@ -564,6 +565,49 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
         }
     }
     (!spans.is_empty()).then_some(spans)
+}
+
+/// `33.1 tok/s · ×3 96 tok/s (avg 31.4)`: the latest call's speed (any
+/// agent); while several agents are generating at once, their combined
+/// throughput and count; and the session's per-call average. Hidden once
+/// the last call is older than `stale_secs`, so an idle session doesn't
+/// keep showing an old number.
+fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
+    let speed = &ctx.stats.as_ref()?.speed;
+    let last = speed.last()?;
+    let stale = seg.opt_int("stale_secs", 300);
+    if stale > 0 && ctx.now - last.end / 1000.0 > stale as f64 {
+        return None;
+    }
+    let fmt = |v: f64| {
+        if v >= 100.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    let unit = if compact { "t/s" } else { "tok/s" };
+    let mut spans = vec![plain(format!("{} {unit}", fmt(last.rate())))];
+    if seg.opt_bool("show_parallel", true) {
+        let window = seg.opt_int("window_secs", 30).max(1) as f64;
+        if let Some(tp) = speed.throughput(window).filter(|t| t.agents > 1) {
+            spans.push(plain(if compact { " " } else { " · " }));
+            spans.push(colored(
+                format!("×{} {} {unit}", tp.agents, fmt(tp.tokens_per_sec)),
+                token("accent"),
+            ));
+        }
+    }
+    if seg.opt_bool("show_avg", true) && !compact {
+        if let Some(avg) = speed.average() {
+            let label = if ctx.zh() { "均" } else { "avg" };
+            spans.push(colored(
+                format!(" ({label} {})", fmt(avg)),
+                token("text_muted"),
+            ));
+        }
+    }
+    Some(spans)
 }
 
 fn fmt_reset(rfc3339: &str, now: f64, zh: bool, compact: bool) -> Option<String> {
@@ -783,8 +827,8 @@ pub fn render(ctx: &Ctx, width: Option<usize>) -> String {
         return full;
     }
     use SegmentId::*;
-    const DROP_ORDER: [SegmentId; 8] = [
-        Session, Git, Directory, Subagent, Tasks, Goal, Context, Mode,
+    const DROP_ORDER: [SegmentId; 10] = [
+        Session, Tps, Git, Directory, Subagent, Tasks, Goal, Context, Quota, Mode,
     ];
     let mut dropped = Vec::new();
     let mut line = compose(ctx, true, &dropped);

@@ -101,10 +101,12 @@ pub enum SegmentId {
     Session,
     /// plan quota: 5h / 7d limits and reset times
     Quota,
+    /// output tokens per second
+    Tps,
 }
 
 impl SegmentId {
-    pub const ALL: [SegmentId; 11] = [
+    pub const ALL: [SegmentId; 12] = [
         SegmentId::Mode,
         SegmentId::Goal,
         SegmentId::Model,
@@ -116,6 +118,7 @@ impl SegmentId {
         SegmentId::Subagent,
         SegmentId::Session,
         SegmentId::Quota,
+        SegmentId::Tps,
     ];
 
     pub fn name(self) -> &'static str {
@@ -131,6 +134,7 @@ impl SegmentId {
             SegmentId::Subagent => "Subagent",
             SegmentId::Session => "Session",
             SegmentId::Quota => "Quota",
+            SegmentId::Tps => "TPS",
         }
     }
 }

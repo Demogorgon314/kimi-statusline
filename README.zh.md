@@ -101,8 +101,9 @@ Kimi Code 每秒运行一次状态栏，超过 300ms 就杀掉。kimi-statusline
 | `subagent` | 同上，针对用量最多的子 agent 模型 |
 | `session` | 会话时长（默认关闭） |
 | `quota` | 5h / 7d（可选月度）额度和重置时间 |
+| `tps` | 输出速度：`34.6 tok/s · ×3 90 tok/s (均 31.2)`，即最近一次调用的速度；子 agent 并行时再显示合计吞吐（默认关闭） |
 
-空间不够时按这个顺序去掉：session → git → directory → subagent → tasks → goal → context → quota → mode。
+空间不够时按这个顺序去掉：session → tps → git → directory → subagent → tasks → goal → context → quota → mode。
 
 </details>
 

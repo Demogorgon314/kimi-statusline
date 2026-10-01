@@ -1294,6 +1294,7 @@ fn segment_help(id: SegmentId) -> &'static str {
         SegmentId::Usage => "Whole-session input ↑, output ↓ and cache hit rate.",
         SegmentId::Subagent => "Usage of the heaviest sub-agent model.",
         SegmentId::Session => "Time since the session was created.",
+        SegmentId::Tps => "Output speed of the latest model call (main agent or sub-agent), timed from request to usage record, so it includes time to first token. While several agents generate at once, ×N shows their combined rate over window_secs. avg is the per-call session average. Hidden after stale_secs idle.",
         SegmentId::Quota => "Plan quota: 5h / 7d (and monthly) used % with reset time. Needs a Kimi Code OAuth login; refreshed in the background every refresh_secs.",
     }
 }
