@@ -73,6 +73,8 @@ kimi-statusline adds all of that while keeping everything the built-in footer sh
 
 Toggle and reorder segments, pick colors and icons, switch themes — with a live preview of your own session. Works with the keyboard or the mouse: click to select, click again to toggle or edit, drag segments to reorder them, scroll to move. Inspired by [CCometixLine](https://github.com/Haleclipse/CCometixLine).
 
+Press **Ctrl+C twice within 1.5 seconds** to exit from any TUI screen. The first press shows a confirmation hint; exiting discards unsaved changes.
+
 ## Fast by design
 
 Kimi Code runs the status line every second and kills it after 300 ms. kimi-statusline is a single Rust binary that renders in **~10–20 ms**:

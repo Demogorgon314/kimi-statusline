@@ -38,6 +38,9 @@ pub struct Menu {
     check: Option<mpsc::Receiver<Result<String, String>>>,
     /// waiting for a second Enter/click to install `available`
     confirm_update: bool,
+    ctrl_c: super::CtrlC,
+    /// the hint was on screen last frame (so its expiry needs a redraw)
+    ctrl_c_shown: bool,
 }
 
 impl Default for Menu {
@@ -62,6 +65,8 @@ impl Default for Menu {
             available: available.filter(|t| update::is_newer(t, update::CURRENT)),
             check,
             confirm_update: false,
+            ctrl_c: super::CtrlC::default(),
+            ctrl_c_shown: false,
         }
     }
 }
@@ -171,7 +176,23 @@ impl Menu {
         self.status = Some((msg.into(), true));
     }
 
+    /// True once when the Ctrl+C hint times out, so the screen clears it.
+    pub fn ctrl_c_expired(&mut self) -> bool {
+        let expired = self.ctrl_c_shown && !self.ctrl_c.pending();
+        if expired {
+            self.ctrl_c_shown = false;
+        }
+        expired
+    }
+
     pub fn key(&mut self, k: KeyEvent) -> Action {
+        if super::CtrlC::is_ctrl_c(&k) {
+            if self.ctrl_c.press() {
+                return Action::Quit;
+            }
+            return Action::Stay;
+        }
+        self.ctrl_c.reset();
         if self.about {
             self.about = false;
             return Action::Stay;
@@ -297,6 +318,7 @@ impl Menu {
             button("↑↓", "Navigate", None),
             button("Enter", "Select", Some(key(KeyCode::Enter))),
             button("Esc", "Exit", Some(key(KeyCode::Esc))),
+            button("Ctrl+C×2", "Exit", None),
             button("Click", "select, click again to run", None),
         ];
         let inner_w = f.area().width.saturating_sub(2);
@@ -412,7 +434,13 @@ impl Menu {
             self.hits.push(r, Target::Key(k));
         }
         let mut lines = bar;
-        if let Some((msg, is_err)) = &self.status {
+        self.ctrl_c_shown = self.ctrl_c.pending();
+        if self.ctrl_c_shown {
+            lines.push(Line::styled(
+                super::CTRL_C_HINT,
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some((msg, is_err)) = &self.status {
             lines.push(Line::styled(
                 msg.as_str(),
                 Style::new().fg(if *is_err { Color::Red } else { Color::Green }),

@@ -87,6 +87,10 @@ pub struct App {
     confirm_quit: bool,
     quit: bool,
     hits: Hits<Target>,
+    ctrl_c: super::CtrlC,
+    ctrl_c_shown: bool,
+    /// set by a double Ctrl+C: leave the whole program, not just this screen
+    pub exit_all: bool,
     /// segment list geometry from the last draw: (inner rect, scroll offset)
     seg_list: Option<(Rect, usize)>,
     /// left button held on a segment row
@@ -188,16 +192,29 @@ impl App {
             confirm_quit: false,
             quit: false,
             hits: Hits::new(),
+            ctrl_c: super::CtrlC::default(),
+            ctrl_c_shown: false,
+            exit_all: false,
             seg_list: None,
             press: None,
         }
     }
 
-    pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    /// Returns true when the user asked to leave the whole program (double
+    /// Ctrl+C), false for a normal return to the menu.
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<bool> {
         let mut redraw = true;
         while !self.quit {
+            if self.ctrl_c_shown && !self.ctrl_c.pending() {
+                redraw = true;
+            }
             if redraw {
                 terminal.draw(|f| self.draw(f))?;
+            }
+            // wake up to clear the Ctrl+C hint when it times out
+            if self.ctrl_c_shown && !event::poll(std::time::Duration::from_millis(250))? {
+                redraw = false;
+                continue;
             }
             redraw = match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -209,7 +226,7 @@ impl App {
                 _ => false,
             };
         }
-        Ok(())
+        Ok(self.exit_all)
     }
 
     fn current(&self) -> Option<&SegmentConfig> {
@@ -484,6 +501,15 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // Ctrl+C works the same everywhere, popups included
+        if super::CtrlC::is_ctrl_c(&k) {
+            if self.ctrl_c.press() {
+                self.quit = true;
+                self.exit_all = true;
+            }
+            return;
+        }
+        self.ctrl_c.reset();
         if let Some(popup) = self.popup.take() {
             self.popup_key(popup, k);
             return;
@@ -902,7 +928,18 @@ impl App {
         for (r, k) in help_hits {
             self.hits.push(r, Target::Key(k));
         }
-        if let Some(s) = &self.status {
+        self.ctrl_c_shown = self.ctrl_c.pending();
+        if self.ctrl_c_shown {
+            let hint = if self.config != self.saved {
+                format!("{} (unsaved changes will be lost)", super::CTRL_C_HINT)
+            } else {
+                super::CTRL_C_HINT.to_string()
+            };
+            lines.push(Line::styled(
+                hint,
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(s) = &self.status {
             lines.push(Line::styled(s.as_str(), Style::new().fg(Color::Green)));
         }
         f.render_widget(
@@ -1278,6 +1315,7 @@ fn help_buttons(panel: Panel) -> Vec<Button> {
         ),
         button("?", "Help", k('?')),
         button("Esc", "Quit", Some(KeyEvent::from(KeyCode::Esc))),
+        button("Ctrl+C×2", "Exit", None),
     ]);
     v
 }
@@ -1324,6 +1362,7 @@ const HELP: &str = "\
    C                colors: tui.toml → dark → light
    S                save config.toml        W  write current theme
    Ctrl+S           save as a new theme     Esc quit
+   Ctrl+C twice     exit kimi-statusline right away
 
  Press any key or click to close";
 
@@ -1348,7 +1387,7 @@ pub fn run_configurator() -> Result<(), String> {
     let mut terminal = super::init();
     let result = App::new().run(&mut terminal);
     super::restore();
-    result.map_err(|e| e.to_string())
+    result.map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

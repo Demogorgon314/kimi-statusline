@@ -21,6 +21,43 @@ use unicode_width::UnicodeWidthStr;
 
 pub use app::run_configurator;
 
+/// Ctrl+C twice within this window exits, like Kimi Code itself
+/// (EXIT_CONFIRM_WINDOW_MS upstream).
+pub const EXIT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+pub const CTRL_C_HINT: &str = "Press Ctrl+C again to exit";
+
+/// Tracks the first Ctrl+C of a double press.
+#[derive(Default)]
+pub struct CtrlC(Option<std::time::Instant>);
+
+impl CtrlC {
+    pub fn is_ctrl_c(k: &KeyEvent) -> bool {
+        k.modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+            && matches!(k.code, crossterm::event::KeyCode::Char('c' | 'C'))
+    }
+
+    /// Register a Ctrl+C press; true when it is the second within the
+    /// window (time to exit).
+    pub fn press(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let second = self
+            .0
+            .is_some_and(|t| now.duration_since(t) <= EXIT_CONFIRM_WINDOW);
+        self.0 = if second { None } else { Some(now) };
+        second
+    }
+
+    /// Whether the hint should still be on screen.
+    pub fn pending(&self) -> bool {
+        self.0.is_some_and(|t| t.elapsed() <= EXIT_CONFIRM_WINDOW)
+    }
+
+    pub fn reset(&mut self) {
+        self.0 = None;
+    }
+}
+
 /// Enter the alternate screen with mouse reporting on. The panic hook turns
 /// mouse reporting off again, or the user's shell would keep receiving
 /// escape codes for every click.
@@ -146,7 +183,7 @@ pub fn run_menu() -> Result<(), String> {
         let mut menu = menu::Menu::default();
         let mut redraw = true;
         loop {
-            if menu.poll() {
+            if menu.poll() || menu.ctrl_c_expired() {
                 redraw = true;
             }
             if redraw {
@@ -166,7 +203,10 @@ pub fn run_menu() -> Result<(), String> {
             redraw = action.is_some();
             match action {
                 Some(menu::Action::Quit) => return Ok(()),
-                Some(menu::Action::Configure) => app::App::new().run(&mut terminal)?,
+                // a double Ctrl+C inside the configurator leaves entirely
+                Some(menu::Action::Configure) if app::App::new().run(&mut terminal)? => {
+                    return Ok(())
+                }
                 _ => {}
             }
         }
@@ -179,6 +219,34 @@ pub fn run_menu() -> Result<(), String> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn ctrl_c_needs_two_presses_in_the_window() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(CtrlC::is_ctrl_c(&ctrl_c));
+        assert!(!CtrlC::is_ctrl_c(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+
+        let mut c = CtrlC::default();
+        assert!(!c.pending());
+        assert!(!c.press(), "first press only arms");
+        assert!(c.pending());
+        assert!(c.press(), "second press within the window exits");
+        assert!(!c.pending());
+
+        // a press after the window expired starts over
+        let mut c = CtrlC(Some(std::time::Instant::now() - EXIT_CONFIRM_WINDOW * 2));
+        assert!(!c.pending());
+        assert!(!c.press());
+
+        // any other key in between disarms it
+        let mut c = CtrlC::default();
+        c.press();
+        c.reset();
+        assert!(!c.press());
+    }
 
     #[test]
     fn flow_wraps() {
