@@ -515,7 +515,10 @@ fn usage_triple(ctx: &Ctx, seg: &SegmentConfig, u: &Usage, compact: bool) -> Vec
 
 /// `5h 42% ↻1h20m · 7d 13% ↻Mon 08:00`: used share of each plan window
 /// plus when it resets. Within a day the reset reads as a countdown, further
-/// out as a local weekday + time.
+/// out as a local weekday + time. Numbers can only be fetched while Kimi
+/// Code's login token is fresh, so an idle session keeps old ones: past
+/// `stale_secs` the segment is dimmed, and a window whose reset time has
+/// passed shows `–` (its old share no longer applies) until a fetch lands.
 fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
     let q = ctx.quota.as_ref()?;
     let zh = ctx.zh();
@@ -539,6 +542,16 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
         };
         if !spans.is_empty() {
             spans.push(plain(if compact { " " } else { " · " }));
+        }
+        let expired = e
+            .reset_at
+            .as_deref()
+            .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+            .is_some_and(|at| (at.timestamp() as f64) <= ctx.now);
+        if expired {
+            spans.push(plain(format!("{label} ")));
+            spans.push(colored("–", token("text_muted")));
+            continue;
         }
         let ratio = e.used_ratio.clamp(0.0, 1.0);
         // ceil like upstream usagePercent: any use shows at least 1%
@@ -576,7 +589,19 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
             }
         }
     }
+    let stale_after = seg.opt_int("stale_secs", 600);
+    if stale_after > 0 && q.fetched_at > 0.0 && ctx.now - q.fetched_at > stale_after as f64 {
+        dim_all(&mut spans);
+    }
     (!spans.is_empty()).then_some(spans)
+}
+
+/// Mark a segment's spans as old news: muted and faint.
+fn dim_all(spans: &mut [Span]) {
+    for span in spans {
+        span.color = Some(token("text_muted"));
+        span.dim = true;
+    }
 }
 
 /// `33.1 tok/s · ×3 96 tok/s (avg 31.4)`: the latest call's decode speed
@@ -622,10 +647,7 @@ fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span
         }
     }
     if stale {
-        for span in &mut spans {
-            span.color = Some(token("text_muted"));
-            span.dim = true;
-        }
+        dim_all(&mut spans);
     }
     Some(spans)
 }
@@ -1007,6 +1029,70 @@ mod tests {
         // hide_when_stale restores the old behavior
         let (ctx, seg) = tps_ctx(3600.0, true);
         assert!(tps_segment(&ctx, &seg, false).is_none());
+    }
+
+    fn quota_ctx(fetched_ago: f64, reset_in: f64) -> (Ctx, SegmentConfig) {
+        let (mut ctx, _) = tps_ctx(0.0, false);
+        let seg = ctx.config.segment(SegmentId::Quota).unwrap().clone();
+        let at = |d: f64| {
+            chrono::DateTime::from_timestamp((ctx.now + d) as i64, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        ctx.quota = Some(crate::quota::Quota {
+            limit_5h: Some(crate::quota::Entry {
+                used_ratio: 0.42,
+                reset_at: Some(at(reset_in)),
+            }),
+            limit_7d: Some(crate::quota::Entry {
+                used_ratio: 0.1,
+                reset_at: Some(at(86_400.0 * 3.0)),
+            }),
+            month: None,
+            fetched_at: ctx.now - fetched_ago,
+        });
+        (ctx, seg)
+    }
+
+    #[test]
+    fn old_quota_is_dimmed_and_past_resets_blanked() {
+        let text = |spans: &[Span]| spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        let (ctx, seg) = quota_ctx(60.0, 3_600.0);
+        let spans = quota_segment(&ctx, &seg, true).unwrap();
+        assert!(text(&spans).starts_with("5h 42% ↻1h00m"));
+        assert!(spans.iter().all(|s| !s.dim));
+        // fetched 3 h ago, past stale_secs (600)
+        let (ctx, seg) = quota_ctx(3.0 * 3_600.0, 3_600.0);
+        assert!(quota_segment(&ctx, &seg, true)
+            .unwrap()
+            .iter()
+            .all(|s| s.dim));
+        // the 5h window has since reset: its old share is meaningless
+        let (ctx, seg) = quota_ctx(3.0 * 3_600.0, -60.0);
+        let t = text(&quota_segment(&ctx, &seg, true).unwrap());
+        assert!(t.starts_with("5h – 7d 10%"), "{t}");
+    }
+
+    #[test]
+    fn render_fits_width_by_compacting_then_dropping() {
+        let (mut ctx, _) = tps_ctx(0.0, false);
+        ctx.color = false;
+        ctx.payload.model = "kimi-code/k3".into();
+        ctx.payload.cwd = "/a/b/c/d/e/f".into();
+        ctx.payload.git_branch = Some("feature/some-long-branch".into());
+        let full = render(&ctx, None);
+        let w = visible_width(&full);
+        assert_eq!(render(&ctx, Some(w)), full);
+        for width in [w - 1, w / 2, 20, 5] {
+            let line = render(&ctx, Some(width));
+            assert!(visible_width(&line) <= width, "{width}: {line:?}");
+        }
+        // the model outlives the directory and git when space runs short
+        let narrow = render(&ctx, Some(20));
+        assert!(
+            narrow.contains("k3") && !narrow.contains("feature"),
+            "{narrow:?}"
+        );
     }
 
     #[test]

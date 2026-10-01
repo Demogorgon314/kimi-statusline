@@ -10,17 +10,27 @@ $binDir = if ($env:KIMI_STATUSLINE_BIN_DIR) { $env:KIMI_STATUSLINE_BIN_DIR } els
 $version = if ($env:KIMI_STATUSLINE_VERSION) { $env:KIMI_STATUSLINE_VERSION } else { 'latest' }
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
 $asset = "kimi-statusline-windows-$arch.zip"
-$url = if ($version -eq 'latest') {
-  "https://github.com/$repo/releases/latest/download/$asset"
+$base = if ($version -eq 'latest') {
+  "https://github.com/$repo/releases/latest/download"
 } else {
-  "https://github.com/$repo/releases/download/$version/$asset"
+  "https://github.com/$repo/releases/download/$version"
 }
 
 $tmp = Join-Path $env:TEMP ("kimi-statusline-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {
-  Write-Host "Downloading $url"
-  Invoke-WebRequest -UseBasicParsing $url -OutFile (Join-Path $tmp $asset)
+  Write-Host "Downloading $base/$asset"
+  $archive = Join-Path $tmp $asset
+  Invoke-WebRequest -UseBasicParsing "$base/$asset" -OutFile $archive
+  $sums = (Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS").Content
+  if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+  $expected = $sums -split "`n" | ForEach-Object {
+    $f = $_.Trim() -split '\s+'
+    if ($f.Count -ge 2 -and $f[1].TrimStart('*') -eq $asset) { $f[0] }
+  } | Select-Object -First 1
+  if (-not $expected) { throw "$asset is not listed in SHA256SUMS" }
+  $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash
+  if ($actual -ne $expected) { throw "checksum mismatch for $asset (expected $expected, got $actual)" }
   Expand-Archive -Force (Join-Path $tmp $asset) $tmp
   New-Item -ItemType Directory -Force $binDir | Out-Null
   $exe = Join-Path $binDir 'kimi-statusline.exe'

@@ -11,11 +11,13 @@
 
 use crate::paths;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 const DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 const GLOBAL_BASE_URL: &str = "https://api.kimi.ai/coding/v1";
+const DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
+const DEFAULT_KEY: &str = "oauth/kimi-code";
 /// Don't spawn another fetch while one may still be running.
 const FETCH_LOCK_S: f64 = 20.0;
 
@@ -30,6 +32,10 @@ pub struct Quota {
     pub limit_5h: Option<Entry>,
     pub limit_7d: Option<Entry>,
     pub month: Option<Entry>,
+    /// unix seconds the numbers were fetched at (0 when unknown); filled in
+    /// from the cache, so it is not part of the stored value
+    #[serde(skip)]
+    pub fetched_at: f64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -84,33 +90,11 @@ pub fn get(ttl: f64) -> Option<Quota> {
             .map_or(f64::MAX, |t| now - t);
         if lock_age > FETCH_LOCK_S {
             let _ = paths::write_atomic(&lock_path(), now.to_string().as_bytes());
-            spawn_fetch();
+            paths::spawn_self(&["fetch-quota"]);
         }
     }
-    cache.v
-}
-
-fn spawn_fetch() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut cmd = Command::new(exe);
-    cmd.arg("fetch-quota")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // own process group: the TUI kills ours at 300ms
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
-    }
-    let _ = cmd.spawn();
+    let fetched_at = cache.fetched_at;
+    cache.v.map(|q| Quota { fetched_at, ..q })
 }
 
 /// `fetch-quota`: one request, result into the cache. Errors are recorded
@@ -132,7 +116,10 @@ pub fn fetch_and_store() -> Result<Quota, String> {
     }
     let _ = std::fs::remove_file(lock_path());
     paths::debug(&format!("fetch-quota: {:?}", result.as_ref().map(|_| "ok")));
-    result
+    result.map(|q| Quota {
+        fetched_at: cache.fetched_at,
+        ..q
+    })
 }
 
 /// Last fetch error, for `kimi-statusline quota` diagnostics.
@@ -145,11 +132,17 @@ struct Login {
     credential: PathBuf,
 }
 
-/// Where to ask and with which credential slot, following Kimi Code:
-/// `KIMI_CODE_BASE_URL`, else the managed provider in config.toml, else the
-/// region marker (`global` → api.kimi.ai), else mainland.
+/// Where to ask and with which credential slot, following Kimi Code's
+/// resolveKimiCodeRuntimeAuth: the base URL is `KIMI_CODE_BASE_URL`, else
+/// the managed provider in config.toml, else the region marker (`global` →
+/// api.kimi.ai), else mainland. The slot is the one config.toml names unless
+/// an env override is set or it disagrees with the slot those endpoints
+/// imply (any non-default endpoint gets its own `kimi-code-env-<hash>`).
 fn login() -> Login {
     let home = paths::kimi_home();
+    let env = |k: &str| std::env::var(k).ok();
+    let region_global =
+        std::fs::read_to_string(home.join("region")).is_ok_and(|r| r.trim() == "global");
     let provider = std::fs::read_to_string(home.join("config.toml"))
         .ok()
         .and_then(|t| t.parse::<toml::Table>().ok())
@@ -159,19 +152,20 @@ fn login() -> Login {
                 .as_table()
                 .cloned()
         });
-    let cfg_base = provider
-        .as_ref()
-        .and_then(|p| p.get("base_url")?.as_str().map(str::to_string));
-    let key = provider
-        .as_ref()
-        .and_then(|p| p.get("oauth")?.get("key")?.as_str().map(str::to_string))
-        .unwrap_or_else(|| "oauth/kimi-code".into());
-    let region_global =
-        std::fs::read_to_string(home.join("region")).is_ok_and(|r| r.trim() == "global");
-    let base_url = std::env::var("KIMI_CODE_BASE_URL")
-        .ok()
+    let cfg_str = |path: &[&str]| -> Option<String> {
+        let mut v = provider.as_ref()?.get(path[0])?;
+        for k in &path[1..] {
+            v = v.get(k)?;
+        }
+        v.as_str().map(str::to_string)
+    };
+    let env_base = env("KIMI_CODE_BASE_URL");
+    let env_host = env("KIMI_CODE_OAUTH_HOST").or_else(|| env("KIMI_OAUTH_HOST"));
+    let has_env = env_base.is_some() || env_host.is_some();
+    let base_url = env_base
+        .clone()
+        .or_else(|| cfg_str(&["base_url"]))
         .filter(|s| !s.is_empty())
-        .or(cfg_base)
         .unwrap_or_else(|| {
             if region_global {
                 GLOBAL_BASE_URL
@@ -180,11 +174,44 @@ fn login() -> Login {
             }
             .into()
         });
+    let host = if has_env {
+        env_host
+    } else {
+        cfg_str(&["oauth", "oauth_host"])
+    };
+    // upstream resolves the slot from the raw configured base URL, without
+    // the region fallback
+    let key_base = env_base.or_else(|| cfg_str(&["base_url"]));
+    let expected = oauth_key(host.as_deref(), key_base.as_deref());
+    let key = match cfg_str(&["oauth", "key"]) {
+        Some(k) if !has_env && k == expected => k,
+        _ => expected,
+    };
     let name = key.strip_prefix("oauth/").unwrap_or(&key).to_string();
     Login {
         base_url: base_url.trim_end_matches('/').to_string(),
         credential: home.join("credentials").join(format!("{name}.json")),
     }
+}
+
+/// Upstream resolveKimiCodeOAuthKey: the default host and endpoint share
+/// `oauth/kimi-code`; any other pair gets a slot named after its hash.
+fn oauth_key(host: Option<&str>, base_url: Option<&str>) -> String {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_string();
+    let host = norm(host.unwrap_or(DEFAULT_OAUTH_HOST));
+    let base = norm(base_url.unwrap_or(DEFAULT_BASE_URL));
+    if host == DEFAULT_OAUTH_HOST && base == DEFAULT_BASE_URL {
+        return DEFAULT_KEY.into();
+    }
+    // key order matters for the hash: JSON.stringify keeps insertion order,
+    // serde_json's map would sort it
+    let q = |s: &str| serde_json::Value::from(s).to_string();
+    let json = format!(r#"{{"oauthHost":{},"baseUrl":{}}}"#, q(&host), q(&base));
+    let digest: String = Sha256::digest(json.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("oauth/kimi-code-env-{}", &digest[..16])
 }
 
 fn access_token(path: &PathBuf) -> Result<String, String> {
@@ -258,6 +285,7 @@ pub fn parse(body: &serde_json::Value) -> Quota {
         limit_5h: entry("limit_5h"),
         limit_7d: entry("limit_7d"),
         month: entry("limit_month_total"),
+        fetched_at: 0.0,
     }
 }
 
@@ -282,5 +310,19 @@ mod tests {
         assert_eq!(q.limit_7d.as_ref().unwrap().used_ratio, 0.1);
         assert!(q.limit_7d.unwrap().reset_at.is_none());
         assert!(q.month.is_none());
+    }
+
+    #[test]
+    fn oauth_slot_matches_upstream() {
+        assert_eq!(oauth_key(None, None), "oauth/kimi-code");
+        assert_eq!(
+            oauth_key(Some("https://auth.kimi.com/"), Some(DEFAULT_BASE_URL)),
+            "oauth/kimi-code"
+        );
+        // node: sha256(JSON.stringify({oauthHost, baseUrl})).slice(0, 16)
+        assert_eq!(
+            oauth_key(None, Some("https://example.test/coding/v1/")),
+            "oauth/kimi-code-env-2cad1c19794545b8"
+        );
     }
 }

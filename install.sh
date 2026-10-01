@@ -28,21 +28,40 @@ esac
 
 asset="kimi-statusline-$os-$arch.tar.gz"
 if [ "$version" = latest ]; then
-  url="https://github.com/$repo/releases/latest/download/$asset"
+  base="https://github.com/$repo/releases/latest/download"
 else
-  url="https://github.com/$repo/releases/download/$version/$asset"
+  base="https://github.com/$repo/releases/download/$version"
 fi
+
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$2" "$1"
+  else
+    die "need curl or wget"
+  fi
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    die "need sha256sum or shasum to verify the download"
+  fi
+}
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-say "Downloading $url"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL -o "$tmp/$asset" "$url" || die "download failed"
-elif command -v wget >/dev/null 2>&1; then
-  wget -q -O "$tmp/$asset" "$url" || die "download failed"
-else
-  die "need curl or wget"
-fi
+say "Downloading $base/$asset"
+fetch "$base/$asset" "$tmp/$asset" || die "download failed"
+fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "could not download SHA256SUMS"
+expected="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS")"
+[ -n "$expected" ] || die "$asset is not listed in SHA256SUMS"
+actual="$(sha256 "$tmp/$asset")"
+[ "$actual" = "$expected" ] || die "checksum mismatch for $asset (expected $expected, got $actual)"
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$bin_dir"
 mv -f "$tmp/kimi-statusline" "$bin_dir/kimi-statusline"

@@ -77,10 +77,10 @@ Press **Ctrl+C twice within 1.5 seconds** to exit from any TUI screen. The first
 
 ## Fast by design
 
-Kimi Code runs the status line every second and kills it after 300 ms. kimi-statusline is a single Rust binary that renders in **~10–20 ms**:
+Kimi Code reruns the status line whenever its footer repaints — at most once a second, so clocks and countdowns pause while the TUI sits idle — and kills it after 300 ms. kimi-statusline is a single Rust binary that renders in **~10–20 ms**:
 
 - Session logs are read **incrementally** — a 100 MB session costs the same as a fresh one
-- Network calls (quota, `gh pr view`) run **in the background**; the status line only reads caches
+- Network calls and slow probes (quota, `gh pr view`, `git status`) run **in the background**; the status line only reads caches
 - Narrow terminal? It **compacts and drops** low-priority segments instead of getting cut off
 
 ![Adaptive width](assets/adaptive.png)
@@ -129,7 +129,7 @@ palette = ""            # "" follows tui.toml; or dark / light / a Kimi theme na
 id = "quota"
 enabled = true
 colors = { text = "text_dim" }   # c16 / c256 / RGB / "#rrggbb" / Kimi palette name
-options = { show_5h = true, show_7d = true, show_month = false, bar = false, refresh_secs = 120 }
+options = { show_5h = true, show_7d = true, show_month = false, bar = false, refresh_secs = 120, stale_secs = 600 }
 ```
 
 Kimi palette names (`primary`, `accent`, `text_dim`, `success`, `warning`, `error`, …) follow your TUI theme, dark or light.
@@ -141,7 +141,7 @@ Kimi palette names (`primary`, `accent`, `text_dim`, `success`, `warning`, `erro
 
 It calls the same endpoint as Kimi Code's `/usage`, with the login Kimi Code already stores in `~/.kimi-code/credentials/`. Requests run in the background at most every `refresh_secs`.
 
-kimi-statusline never refreshes your login itself — racing Kimi Code's token rotation could log you out. If Kimi Code sits idle long enough for its token to expire, the quota holds its last value and updates after your next message. `kimi-statusline quota` fetches it on demand.
+kimi-statusline never refreshes your login itself — racing Kimi Code's token rotation could log you out. If Kimi Code sits idle long enough for its token to expire, the quota holds its last value — dimmed once it is older than `stale_secs`, and shown as `–` for a window whose reset time has passed — and updates after your next message. `kimi-statusline quota` fetches it on demand.
 
 </details>
 

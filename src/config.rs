@@ -332,11 +332,18 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Segments added in a newer version than the one that wrote this
-    /// config: append them, disabled, styled like the same theme's built-in
+    /// Segments (and segment options) added in a newer version than the one
+    /// that wrote this config: append them, disabled, styled like the same theme's built-in
     /// preset, so they show up in the configurator without changing what
     /// the status line already renders.
     pub fn add_missing_segments(&mut self) {
+        // options a newer version introduced: their defaults are what the
+        // renderer already falls back to, so this only makes them editable
+        for seg in &mut self.segments {
+            for (k, v) in crate::themes::default_options(seg.id) {
+                seg.options.entry(k).or_insert(v);
+            }
+        }
         let missing: Vec<SegmentId> = SegmentId::ALL
             .into_iter()
             .filter(|id| self.segment(*id).is_none())

@@ -83,6 +83,12 @@ enum Cmd {
     /// Background quota refresh, spawned by the status line
     #[command(hide = true)]
     FetchQuota,
+    /// Background git status probe, spawned by the status line
+    #[command(hide = true)]
+    ProbeGit {
+        #[arg(long)]
+        cwd: String,
+    },
     /// Render for the newest session in a directory, without the TUI
     Preview {
         /// Working directory of the session (default: current dir)
@@ -145,6 +151,12 @@ fn main() {
         Some(Cmd::Update { check }) => update_cmd(check),
         Some(Cmd::FetchQuota) => {
             let _ = quota::fetch_and_store();
+            // off the status line's clock: a good time to tidy up
+            paths::sweep_cache();
+            Ok(())
+        }
+        Some(Cmd::ProbeGit { cwd }) => {
+            let _ = probe::refresh_git(&cwd);
             Ok(())
         }
         Some(Cmd::Preview {
@@ -154,7 +166,7 @@ fn main() {
         }) => {
             let cwd = cwd.unwrap_or_else(current_dir);
             let payload = collect::sample_payload(&cwd, session);
-            let ctx = collect::collect(payload, load_config(cli.theme.as_deref()), Instant::now());
+            let ctx = collect::collect(payload, load_config(cli.theme.as_deref()), false);
             println!("{}", render::render(&ctx, width.or(cli.width)));
             Ok(())
         }
@@ -270,7 +282,7 @@ fn run_statusline(theme: Option<&str>, plugin: bool, width_flag: Option<usize>) 
         } else {
             None
         };
-        let ctx = collect::collect(payload, config, started);
+        let ctx = collect::collect(payload, config, true);
         render::render(&ctx, width)
     })
     .unwrap_or_else(|_| "kimi-statusline: error (see kimi-statusline-debug.log)".into());

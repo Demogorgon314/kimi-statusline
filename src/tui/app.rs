@@ -20,7 +20,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Panel {
@@ -147,6 +146,7 @@ fn fill_demo(ctx: &mut Ctx) {
                 used_ratio: 0.31,
                 reset_at: Some(reset(400)),
             }),
+            fetched_at: ctx.now,
         });
     }
     if ctx.session_created.is_none() {
@@ -178,7 +178,7 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let payload = collect::sample_payload(&cwd, None);
-        let mut ctx = collect::collect(payload, config.clone(), Instant::now());
+        let mut ctx = collect::collect(payload, config.clone(), false);
         fill_demo(&mut ctx);
         App {
             saved: config.clone(),
@@ -1333,7 +1333,7 @@ fn segment_help(id: SegmentId) -> &'static str {
         SegmentId::Subagent => "Usage of the heaviest sub-agent model.",
         SegmentId::Session => "Time since the session was created.",
         SegmentId::Tps => "Decode speed of the latest model call (main agent or sub-agent): output tokens over streaming time, as measured by Kimi Code; time to first token is excluded. While several agents stream at once, ×N shows their combined rate over window_secs. avg is token-weighted over the session. Stays on screen when idle, dimmed after stale_secs (hide_when_stale removes it instead).",
-        SegmentId::Quota => "Plan quota: 5h / 7d (and monthly) used % with reset time. Needs a Kimi Code OAuth login; refreshed in the background every refresh_secs.",
+        SegmentId::Quota => "Plan quota: 5h / 7d (and monthly) used % with reset time. Needs a Kimi Code OAuth login; refreshed in the background every refresh_secs. Kimi Code's login token expires while it sits idle, so numbers older than stale_secs are dimmed, and a window past its reset time shows – until the next fetch.",
     }
 }
 

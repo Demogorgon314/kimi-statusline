@@ -6,13 +6,11 @@ use crate::payload::Payload;
 use crate::render::Ctx;
 use crate::{paths, probe, session};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Spawned probes (git) are skipped past this point, keeping their stale
-/// cached values, so the run stays under the TUI's 300ms cap.
-const PROBE_BUDGET: Duration = Duration::from_millis(120);
-
-pub fn collect(payload: Payload, config: Config, started: Instant) -> Ctx {
+/// `live`: running as the TUI's status line, where nothing slow (spawned
+/// probes) may run inline under the 300ms cap.
+pub fn collect(payload: Payload, config: Config, live: bool) -> Ctx {
     let models = Models::load();
     let palette_name = (!config.style.palette.is_empty()).then_some(config.style.palette.as_str());
     let palette = kimi_config::palette(palette_name);
@@ -72,7 +70,7 @@ pub fn collect(payload: Payload, config: Config, started: Instant) -> Ctx {
     let in_repo = payload.git_branch.is_some() && !payload.cwd.is_empty();
     let git = git_seg
         .filter(|s| in_repo && s.opt_bool("status", true))
-        .and_then(|_| probe::git_status(&payload.cwd, started.elapsed() > PROBE_BUDGET));
+        .and_then(|_| probe::git_status(&payload.cwd, live));
     let pr = match (git_seg, &payload.git_branch) {
         (Some(s), Some(branch)) if in_repo && s.opt_bool("pr", true) => {
             probe::pull_request(&payload.cwd, branch)

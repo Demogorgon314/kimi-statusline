@@ -77,10 +77,10 @@ Kimi Code 自带的底栏只告诉你模型和目录，但不告诉你：
 
 ## 为速度而生
 
-Kimi Code 每秒运行一次状态栏，超过 300ms 就杀掉。kimi-statusline 是单个 Rust 二进制，一次渲染约 **10–20ms**：
+Kimi Code 在底栏重绘时运行状态栏（最多每秒一次，所以 TUI 闲置时计时和倒计时会暂停），超过 300ms 就杀掉。kimi-statusline 是单个 Rust 二进制，一次渲染约 **10–20ms**：
 
 - **增量读取**会话日志：100MB 的会话和新会话一样快
-- 额度、`gh pr view` 这类网络请求都在**后台**做，状态栏只读缓存
+- 额度、`gh pr view`、`git status` 这类网络请求和慢探测都在**后台**做，状态栏只读缓存
 - 终端变窄时**自动精简**，先去掉不重要的段，而不是被截断
 
 ![自适应宽度](assets/adaptive.png)
@@ -129,7 +129,7 @@ palette = ""            # "" 跟随 tui.toml；或 dark / light / Kimi 主题名
 id = "quota"
 enabled = true
 colors = { text = "text_dim" }   # c16 / c256 / RGB / "#rrggbb" / Kimi 配色名
-options = { show_5h = true, show_7d = true, show_month = false, bar = false, refresh_secs = 120 }
+options = { show_5h = true, show_7d = true, show_month = false, bar = false, refresh_secs = 120, stale_secs = 600 }
 ```
 
 Kimi 配色名（`primary`、`accent`、`text_dim`、`success`、`warning`、`error` 等）会跟随 TUI 的深色或浅色主题。
@@ -141,7 +141,7 @@ Kimi 配色名（`primary`、`accent`、`text_dim`、`success`、`warning`、`er
 
 调用的是 Kimi Code `/usage` 同一个接口，用的是 Kimi Code 已经存在 `~/.kimi-code/credentials/` 里的登录凭据。请求在后台进行，最多每 `refresh_secs` 秒一次。
 
-kimi-statusline 不会自己刷新登录凭据：和 Kimi Code 抢着更换 token 可能把你登出。Kimi Code 闲置太久、凭据过期时，额度会停在最后一次的数值，下次发消息后自动更新。`kimi-statusline quota` 可以随时手动拉取。
+kimi-statusline 不会自己刷新登录凭据：和 Kimi Code 抢着更换 token 可能把你登出。Kimi Code 闲置太久、凭据过期时，额度会停在最后一次的数值（超过 `stale_secs` 会变暗，已过重置时间的窗口显示 `–`），下次发消息后自动更新。`kimi-statusline quota` 可以随时手动拉取。
 
 </details>
 

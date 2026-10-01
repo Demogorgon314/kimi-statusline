@@ -55,7 +55,7 @@ fn icons(id: SegmentId, minimal: bool) -> (&'static str, &'static str) {
     }
 }
 
-fn default_options(id: SegmentId) -> BTreeMap<String, toml::Value> {
+pub fn default_options(id: SegmentId) -> BTreeMap<String, toml::Value> {
     let mut o = BTreeMap::new();
     let mut put = |k: &str, v: toml::Value| {
         o.insert(k.to_string(), v);
@@ -85,6 +85,7 @@ fn default_options(id: SegmentId) -> BTreeMap<String, toml::Value> {
             put("bar", false.into());
             put("colorful", true.into());
             put("refresh_secs", 120.into());
+            put("stale_secs", 600.into());
         }
         SegmentId::Tps => {
             put("show_avg", true.into());

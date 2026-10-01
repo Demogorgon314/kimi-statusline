@@ -85,6 +85,12 @@ pub struct GitStatus {
 }
 
 const GIT_TTL: f64 = 15.0; // upstream STATUS_TTL_MS
+/// Per git call when probing outside the status line's 300ms budget.
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn git_cache_name(cwd: &str) -> String {
+    format!("git-{}.json", paths::short_hash(cwd))
+}
 
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
     run_with_timeout(
@@ -92,7 +98,7 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
             .arg("--no-optional-locks")
             .args(args)
             .current_dir(cwd),
-        Duration::from_millis(150),
+        GIT_TIMEOUT,
     )
 }
 
@@ -141,25 +147,35 @@ fn probe_git(cwd: &str) -> Option<GitStatus> {
     Some(st)
 }
 
-/// Working-tree status for `cwd`, refreshed at most every 15s. When the run
-/// is already over budget the stale value is kept instead of spawning git.
-pub fn git_status(cwd: &str, over_budget: bool) -> Option<GitStatus> {
-    let name = format!("git-{}.json", paths::short_hash(cwd));
+/// Probe `cwd` now and cache the answer; a failed probe keeps the previous
+/// value. The status line runs this as the detached `probe-git` subcommand.
+pub fn refresh_git(cwd: &str) -> Option<GitStatus> {
+    let name = git_cache_name(cwd);
+    let value = probe_git(cwd).or_else(|| cached::<Option<GitStatus>>(&name, GIT_TTL).0.flatten());
+    store(&name, &value);
+    value
+}
+
+/// Working-tree status for `cwd`, refreshed at most every 15s. Two git calls
+/// on a large repo can take longer than the TUI's whole 300ms, and a killed
+/// run caches nothing, so the status line (`live`) never probes inline: it
+/// shows the cached value and leaves the probe to a detached child, whose
+/// answer the next refresh picks up. Elsewhere (preview, configurator) the
+/// probe runs in place.
+pub fn git_status(cwd: &str, live: bool) -> Option<GitStatus> {
+    let name = git_cache_name(cwd);
     let (prev, stale) = cached::<Option<GitStatus>>(&name, GIT_TTL);
-    if !stale || over_budget {
-        return prev.flatten();
+    let prev = prev.flatten();
+    if !stale {
+        return prev;
     }
-    match probe_git(cwd) {
-        Some(v) => {
-            store(&name, &Some(v));
-            Some(v)
-        }
-        None => {
-            let prev = prev.flatten();
-            store(&name, &prev);
-            prev
-        }
+    if !live {
+        return refresh_git(cwd);
     }
+    // stamp first so the runs before the child finishes don't spawn more
+    store(&name, &prev);
+    paths::spawn_self(&["probe-git", "--cwd", cwd]);
+    prev
 }
 
 // ---------------------------------------------------------------------------
@@ -424,23 +440,8 @@ fn spawn_gh(cwd: &str, out: &Path) {
     cmd.args(["pr", "view", "--json", "number,url"])
         .current_dir(cwd)
         .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
-        .stdout(file)
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // own process group: the TUI kills ours at 300ms, gh must survive
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-    }
+        .env("GH_PROMPT_DISABLED", "1");
+    paths::detach(&mut cmd).stdout(file);
     let _ = cmd.spawn();
 }
 
@@ -459,11 +460,53 @@ pub enum Dance {
     Hold,
 }
 
+/// Where the scan of one history file stopped, and what it had seen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct DanceScan {
+    offset: u64,
+    /// the latest /dance command: None (never, or `off`), Some(true) for
+    /// `on`, Some(false) for a plain one-shot
+    last: Option<bool>,
+    /// the newest history entry is that /dance command
+    newest: bool,
+}
+
+/// Fold the complete history lines in `chunk` into `scan`.
+fn scan_dance(scan: &mut DanceScan, chunk: &str) {
+    for line in chunk.lines().filter(|l| !l.trim().is_empty()) {
+        let command = line
+            .contains("dance")
+            .then(|| serde_json::from_str::<serde_json::Value>(line).ok())
+            .flatten()
+            .and_then(|v| v.get("content")?.as_str().map(|s| s.trim().to_string()))
+            .and_then(|c| {
+                let sub = c.strip_prefix("/dance")?;
+                (sub.is_empty() || sub.starts_with(char::is_whitespace))
+                    .then(|| sub.trim().to_lowercase())
+            });
+        scan.newest = command.is_some();
+        if let Some(sub) = command {
+            scan.last = match sub.as_str() {
+                "off" => None,
+                "on" => Some(true),
+                _ => Some(false),
+            };
+        }
+    }
+}
+
+/// History this far back is enough for a first scan; later runs only read
+/// what was appended.
+const DANCE_FIRST_SCAN: u64 = 1 << 20;
+
 /// Reconstruct the /dance state from the per-cwd input history
 /// (`<home>/user-history/md5(workDir).jsonl`), where every submitted slash
 /// command lands. Follows upstream tryHandleDanceCommand: `/dance off` clears,
 /// `/dance on` flows then holds, anything else flows then fades. Entries
-/// carry no timestamp, so the flow window is reckoned from the file's mtime.
+/// carry no timestamp, so the flow window is reckoned from the file's mtime,
+/// and only while the /dance is still the newest entry: the next prompt
+/// touches the file too. The file is scanned incrementally, so a `/dance on`
+/// keeps holding however much history follows it.
 pub fn dance_state(cwd: &str) -> Option<Dance> {
     if cwd.is_empty() {
         return None;
@@ -477,49 +520,119 @@ pub fn dance_state(cwd: &str) -> Option<Dance> {
         .iter()
         .map(|v| dir.join(format!("{:x}.jsonl", md5::compute(v.as_bytes()))))
         .find(|p| p.is_file())?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let len = meta.len();
 
-    let mut f = std::fs::File::open(&path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let mut tail = Vec::new();
-    use std::io::{Read, Seek, SeekFrom};
-    f.seek(SeekFrom::Start(len.saturating_sub(8192))).ok()?;
-    f.read_to_end(&mut tail).ok()?;
-
-    let mut last = None;
-    for line in String::from_utf8_lossy(&tail).lines() {
-        if !line.contains("dance") {
-            continue;
+    let name = format!("dance-{}.json", paths::short_hash(&path.to_string_lossy()));
+    let prior = cached::<DanceScan>(&name, f64::INFINITY)
+        .0
+        .filter(|s| s.offset <= len);
+    let mut scan = prior.clone().unwrap_or(DanceScan {
+        offset: len.saturating_sub(DANCE_FIRST_SCAN),
+        ..Default::default()
+    });
+    if scan.offset < len {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut buf = Vec::new();
+        let mut f = std::fs::File::open(&path).ok()?;
+        f.seek(SeekFrom::Start(scan.offset)).ok()?;
+        f.take(len - scan.offset).read_to_end(&mut buf).ok()?;
+        // a cold start may land mid-line: skip to the first whole one
+        let from = if prior.is_none() && scan.offset > 0 {
+            buf.iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| i + 1)
+        } else {
+            0
+        };
+        // leave a line still being written for next time
+        let to = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if to > from {
+            scan_dance(&mut scan, &String::from_utf8_lossy(&buf[from..to]));
         }
-        let Some(content) = serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .and_then(|v| v.get("content")?.as_str().map(|s| s.trim().to_string()))
-        else {
-            continue;
-        };
-        let Some(sub) = content.strip_prefix("/dance") else {
-            continue;
-        };
-        if !(sub.is_empty() || sub.starts_with(char::is_whitespace)) {
-            continue;
-        }
-        last = match sub.trim().to_lowercase().as_str() {
-            "off" => None,
-            "on" => Some(true),
-            _ => Some(false),
-        };
+        scan.offset += to.max(from) as u64;
     }
-    let hold = last?;
-    let age = std::fs::metadata(&path)
-        .ok()?
+    if prior.as_ref() != Some(&scan) {
+        store(&name, &scan);
+    }
+
+    let hold = scan.last?;
+    let age = meta
         .modified()
         .ok()?
         .elapsed()
         .map_or(0.0, |d| d.as_secs_f64());
-    if age <= DANCE_FLOW_S + 0.5 {
+    if scan.newest && age <= DANCE_FLOW_S + 0.5 {
         Some(Dance::Flow)
     } else if hold {
         Some(Dance::Hold)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(content: &str) -> String {
+        format!("{}\n", serde_json::json!({ "content": content }))
+    }
+
+    #[test]
+    fn dance_flows_only_while_newest() {
+        let mut scan = DanceScan::default();
+        scan_dance(&mut scan, &(entry("hi") + &entry("/dance")));
+        assert_eq!((scan.last, scan.newest), (Some(false), true));
+        // a later prompt ends the flow and the one-shot leaves nothing behind
+        scan_dance(&mut scan, &entry("fix the bug"));
+        assert_eq!((scan.last, scan.newest), (Some(false), false));
+    }
+
+    #[test]
+    fn dance_on_holds_across_later_history() {
+        let mut scan = DanceScan::default();
+        scan_dance(&mut scan, &entry("/dance on"));
+        for _ in 0..1000 {
+            scan_dance(&mut scan, &entry(&"x".repeat(200)));
+        }
+        assert_eq!(scan.last, Some(true));
+        scan_dance(&mut scan, &entry("/dance off"));
+        assert_eq!(scan.last, None);
+        // look-alikes are not the command
+        scan_dance(&mut scan, &entry("/dancefloor"));
+        assert_eq!((scan.last, scan.newest), (None, false));
+    }
+
+    #[test]
+    fn git_porcelain_parsing_counts_ahead_behind_and_conflicts() {
+        let dir = std::env::temp_dir().join(format!("ksl-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !ok(&["init", "-q"]) {
+            return; // no git here
+        }
+        ok(&["config", "user.email", "t@t"]);
+        ok(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a"), "1\n2\n").unwrap();
+        ok(&["add", "a"]);
+        ok(&["commit", "-qm", "init"]);
+        let cwd = dir.to_string_lossy();
+        let clean = probe_git(&cwd).unwrap();
+        assert!(!clean.dirty);
+        std::fs::write(dir.join("a"), "1\n3\n4\n").unwrap();
+        let st = probe_git(&cwd).unwrap();
+        assert!(st.dirty && !st.conflicts);
+        assert_eq!((st.added, st.deleted), (2, 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

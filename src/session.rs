@@ -451,7 +451,12 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
             // truncated/replaced wire: per-file subtotals aren't kept, so
             // start the whole session over
             paths::debug(&format!("{agent}: wire shrank, full re-parse"));
-            return parse_session(dir, None);
+            // the goal clock is anchored in wall time, not in the wires:
+            // carry it over so a live goal doesn't restart from zero
+            let mut fresh = parse_session(dir, None);
+            fresh.goal_key = st.goal_key;
+            fresh.goal_seen_at = st.goal_seen_at;
+            return fresh;
         }
         if size > cur.offset && Instant::now() > deadline {
             paths::debug(&format!("{agent}: parse budget spent, resuming next run"));
@@ -610,6 +615,26 @@ mod tests {
         // agent-0 for 1 s at 30 tok/s → 90 tokens / 2 s
         let tp = st.speed.throughput(2.0).unwrap();
         assert!((tp.tokens_per_sec - 45.0).abs() < 1e-9, "{tp:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shrunk_wire_reparses_but_keeps_goal_clock() {
+        let dir = std::env::temp_dir().join(format!("kimi-sl-shrink-{}", std::process::id()));
+        let main = dir.join("agents/main");
+        std::fs::create_dir_all(&main).unwrap();
+        let rec = |n: u64| {
+            format!("{{\"type\":\"usage.record\",\"usage\":{{\"inputOther\":{n},\"output\":1}}}}\n")
+        };
+        std::fs::write(main.join("wire.jsonl"), rec(100) + &rec(100)).unwrap();
+        let mut st = parse_session(&dir, None);
+        st.goal_key = Some("g".into());
+        st.goal_seen_at = Some(42.0);
+        std::fs::write(main.join("wire.jsonl"), rec(7)).unwrap();
+        let st = parse_session(&dir, Some(st));
+        assert_eq!(st.total.input(), 7);
+        assert_eq!(st.goal_seen_at, Some(42.0));
+        assert_eq!(st.goal_key.as_deref(), Some("g"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
