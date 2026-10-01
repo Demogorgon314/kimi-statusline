@@ -1,6 +1,6 @@
 [package]
 name = "kimi-statusline"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "High-performance status line for Kimi Code CLI, written in Rust"
 license = "MIT"

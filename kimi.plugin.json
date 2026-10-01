@@ -1,6 +1,6 @@
 {
   "name": "kimi-statusline",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "High-performance status line for Kimi Code: session token usage, cache hit rate, 5h/7d quota, sub-agents, git + PR, themes (Rust)",
   "license": "MIT",
   "keywords": [
