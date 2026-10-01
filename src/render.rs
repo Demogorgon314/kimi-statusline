@@ -44,6 +44,9 @@ struct Span {
     text: String,
     color: Option<AnsiColor>,
     bold: bool,
+    /// SGR faint: dims whatever color ends up applied, so it also works on
+    /// powerline backgrounds where the segment's text color wins
+    dim: bool,
 }
 
 fn plain(text: impl Into<String>) -> Span {
@@ -51,6 +54,7 @@ fn plain(text: impl Into<String>) -> Span {
         text: text.into(),
         color: None,
         bold: false,
+        dim: false,
     }
 }
 
@@ -59,6 +63,7 @@ fn colored(text: impl Into<String>, color: AnsiColor) -> Span {
         text: text.into(),
         color: Some(color),
         bold: false,
+        dim: false,
     }
 }
 
@@ -278,6 +283,7 @@ fn segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
                     text: name.into(),
                     color: Some(token(tok)),
                     bold: true,
+                    dim: false,
                 });
             }
             (!spans.is_empty()).then_some(spans)
@@ -434,6 +440,7 @@ fn segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
                 text,
                 color: seg.opt_bool("colorful", true).then(|| token(tok)),
                 bold: false,
+                dim: false,
             }])
         }
         SegmentId::Usage => {
@@ -478,12 +485,14 @@ fn usage_triple(ctx: &Ctx, seg: &SegmentConfig, u: &Usage, compact: bool) -> Vec
             text: format!("↑ {}", fmt_tokens(u.input())),
             color: pick(AnsiColor::Color16 { c16: 4 }),
             bold: false,
+            dim: false,
         },
         plain(if compact { "·" } else { " · " }),
         Span {
             text: format!("↓ {}", fmt_tokens(u.output)),
             color: pick(AnsiColor::Color16 { c16: 5 }),
             bold: false,
+            dim: false,
         },
     ];
     if seg.opt_bool("show_cache", true) {
@@ -497,6 +506,7 @@ fn usage_triple(ctx: &Ctx, seg: &SegmentConfig, u: &Usage, compact: bool) -> Vec
                 text: format!("{label}{}", fmt_rate(r)),
                 color: pick(rgb(cache_color(r))),
                 bold: false,
+                dim: false,
             });
         }
     }
@@ -547,12 +557,14 @@ fn quota_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Sp
                 text: format!("{}{} ", "█".repeat(filled), "░".repeat(8 - filled)),
                 color: colorful.then(|| token(tok)),
                 bold: false,
+                dim: false,
             });
         }
         spans.push(Span {
             text: format!("{pct}%"),
             color: colorful.then(|| token(tok)),
             bold: false,
+            dim: false,
         });
         if show_reset {
             if let Some(reset) = e
@@ -612,6 +624,7 @@ fn tps_segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span
     if stale {
         for span in &mut spans {
             span.color = Some(token("text_muted"));
+            span.dim = true;
         }
     }
     Some(spans)
@@ -731,7 +744,7 @@ fn paint_segment(ctx: &Ctx, seg: &SegmentConfig, spans: Vec<Span>) -> String {
         } else {
             span.color.as_ref().or(seg.colors.text.as_ref())
         };
-        out += &paint(ctx, &span.text, color, bold || span.bold);
+        out += &paint_styled(ctx, &span.text, color, bold || span.bold, span.dim);
     }
     if bg.is_some() {
         out.push(' ');
@@ -740,6 +753,10 @@ fn paint_segment(ctx: &Ctx, seg: &SegmentConfig, spans: Vec<Span>) -> String {
 }
 
 fn paint(ctx: &Ctx, text: &str, color: Option<&AnsiColor>, bold: bool) -> String {
+    paint_styled(ctx, text, color, bold, false)
+}
+
+fn paint_styled(ctx: &Ctx, text: &str, color: Option<&AnsiColor>, bold: bool, dim: bool) -> String {
     if text.is_empty() || !ctx.color {
         return text.to_string();
     }
@@ -747,8 +764,11 @@ fn paint(ctx: &Ctx, text: &str, color: Option<&AnsiColor>, bold: bool) -> String
     if let Some(c) = color.and_then(|c| ctx.sgr(c, false)) {
         codes.push(c);
     }
+    // bold and faint share SGR 22 as their reset, which CLOSE_FG emits
     if bold {
         codes.push("1".into());
+    } else if dim {
+        codes.push("2".into());
     }
     if codes.is_empty() {
         text.to_string()
@@ -982,7 +1002,8 @@ mod tests {
         let (ctx, seg) = tps_ctx(3600.0, false);
         let spans = tps_segment(&ctx, &seg, false).unwrap();
         assert_eq!(spans[0].text, "42.0 tok/s");
-        assert!(spans.iter().all(|s| s.color == muted));
+        assert!(spans.iter().all(|s| s.color == muted && s.dim));
+        assert!(!tps_segment(&tps_ctx(10.0, false).0, &seg, false).unwrap()[0].dim);
         // hide_when_stale restores the old behavior
         let (ctx, seg) = tps_ctx(3600.0, true);
         assert!(tps_segment(&ctx, &seg, false).is_none());
