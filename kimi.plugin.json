@@ -11,8 +11,8 @@
   ],
   "interface": {
     "displayName": "Kimi Statusline",
-    "shortDescription": "Token usage, cache hit rate, git/PR and themes in the TUI footer",
-    "longDescription": "Replaces the footer's first line with a configurable, themeable status line written in Rust. Shows whole-session input/output tokens and cache hit rate, the heaviest sub-agent model, mode/goal/task badges, git diff stats and the open PR. Configure with `kimi-statusline config` in a terminal.",
+    "shortDescription": "Token usage, cache hit rate, 5h/7d quota, git/PR and themes in the TUI footer",
+    "longDescription": "Replaces the footer's first line with a configurable, themeable status line written in Rust. Shows whole-session input/output tokens and cache hit rate, your 5-hour / 7-day plan quota with reset times, the heaviest sub-agent model, mode/goal/task badges, git diff stats and the open PR. Configure with `kimi-statusline config` in a terminal.",
     "websiteURL": "https://github.com/Demogorgon314/kimi-statusline",
     "developerName": "Demogorgon314"
   },
