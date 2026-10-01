@@ -5,8 +5,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+
+/// The project page, from Cargo.toml's `repository`.
+pub const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+const ISSUES: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 
 pub enum Action {
     Stay,
@@ -18,6 +22,8 @@ pub enum Action {
 enum Target {
     Item(usize),
     Key(KeyEvent),
+    /// open this URL in the browser
+    Url(&'static str),
 }
 
 pub struct Menu {
@@ -98,7 +104,12 @@ impl Menu {
             _ => return None,
         }
         if self.about {
-            self.about = false;
+            // links stay clickable in the About box; anywhere else closes it
+            if let Some(Target::Url(url)) = self.hits.at(m.column, m.row) {
+                self.open_url(url);
+            } else {
+                self.about = false;
+            }
             return Some(Action::Stay);
         }
         match self.hits.at(m.column, m.row)? {
@@ -110,6 +121,17 @@ impl Menu {
                 Some(Action::Stay)
             }
             Target::Key(k) => Some(self.key(k)),
+            Target::Url(url) => {
+                self.open_url(url);
+                Some(Action::Stay)
+            }
+        }
+    }
+
+    fn open_url(&mut self, url: &str) {
+        match open_in_browser(url) {
+            Ok(()) => self.ok(format!("Opened {url}")),
+            Err(e) => self.err(format!("Could not open a browser ({e}); visit {url}")),
         }
     }
 
@@ -183,7 +205,7 @@ impl Menu {
         // reserve the status row up front so buttons never shift under the pointer
         let footer = bar_rows + 3;
         let [header, body, foot] = Layout::vertical([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Length(footer),
         ])
@@ -204,10 +226,27 @@ impl Menu {
                     "High-performance Kimi Code status line",
                     Style::new().fg(Color::Gray),
                 ),
+                Line::styled(
+                    REPO,
+                    Style::new()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
             ])
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL).title("Welcome")),
             header,
+        );
+        // Paragraph centers within the inner width (borders excluded)
+        let repo_w = (REPO.len() as u16).min(header.width.saturating_sub(2));
+        self.hits.push(
+            Rect::new(
+                header.x + 1 + (header.width.saturating_sub(2) - repo_w) / 2,
+                header.y + 4,
+                repo_w,
+                1,
+            ),
+            Target::Url(REPO),
         );
 
         let items: Vec<ListItem> = ITEMS
@@ -269,29 +308,82 @@ impl Menu {
         );
 
         if self.about {
-            let area = super::pickers::centered(f.area(), 64, 12);
+            let link = |url: &'static str| {
+                Span::styled(
+                    url,
+                    Style::new()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                )
+            };
+            let label = |t: &'static str| Span::styled(t, Style::new().fg(Color::Gray));
+            let lines = vec![
+                Line::styled(
+                    format!("kimi-statusline v{}", env!("CARGO_PKG_VERSION")),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Line::from(""),
+                Line::from("Status line for Kimi Code CLI: session tokens, cache"),
+                Line::from("hit rate, sub-agents, 5h / 7d quota, git + PR, themes."),
+                Line::from(""),
+                Line::from(vec![label("GitHub: "), link(REPO)]),
+                Line::from(vec![label("Issues: "), link(ISSUES)]),
+                Line::from(""),
+                Line::from(format!("Config: {}", config_path().display())),
+                Line::from(""),
+                Line::styled(
+                    "Click a link to open it · any key or click elsewhere closes",
+                    Style::new().fg(Color::Gray),
+                ),
+            ];
+            // link rows come from the lines themselves, so editing the text
+            // above can't desync the click targets (no wrapping: one line
+            // per row)
+            let rows: Vec<(u16, &'static str)> = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let url = [REPO, ISSUES]
+                        .into_iter()
+                        .find(|u| l.spans.iter().any(|s| s.content == *u))?;
+                    Some((i as u16, url))
+                })
+                .collect();
+            let area = super::pickers::centered(f.area(), 76, lines.len() as u16 + 2);
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(
-                        format!("kimi-statusline v{}", env!("CARGO_PKG_VERSION")),
-                        Style::new().fg(Color::Cyan),
-                    ),
-                    Line::from(""),
-                    Line::from("Status line for Kimi Code CLI: session tokens, cache"),
-                    Line::from("hit rate, sub-agents, 5h / 7d quota, git + PR, themes."),
-                    Line::from(""),
-                    Line::from(format!("Config: {}", config_path().display())),
-                    Line::from(""),
-                    Line::styled(
-                        "Press any key or click to close",
-                        Style::new().fg(Color::Gray),
-                    ),
-                ])
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title("About")),
+                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("About")),
                 area,
             );
+            // after the border, "GitHub: " / "Issues: " take 8 columns
+            let room = area.width.saturating_sub(10);
+            for (row, url) in rows {
+                let w = (url.len() as u16).min(room);
+                self.hits.push(
+                    Rect::new(area.x + 9, area.y + 1 + row, w, 1),
+                    Target::Url(url),
+                );
+            }
         }
     }
+}
+
+/// Open a URL with the platform's default handler.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else {
+        Command::new("xdg-open")
+    };
+    cmd.arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
