@@ -1,0 +1,8 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1000}
+{"type":"goal.create","agentId":"main","goalId":"fixture-goal","objective":"Verify the status line","time":1000,"wallClockResumedAt":1000}
+{"type":"goal.update","agentId":"main","budgetLimits":{"turnBudget":8},"time":2000}
+{"type":"usage.record","agentId":"main","model":"kimi-code/k3","usage":{"inputOther":100,"output":420,"inputCacheRead":900,"inputCacheCreation":0},"usageScope":"turn","time":15000}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":"fixture-step","step":1,"finishReason":"tool_use","usage":{"inputOther":100,"output":420,"inputCacheRead":900,"inputCacheCreation":0},"llmStreamDurationMs":10000,"llmFirstTokenLatencyMs":5000},"time":25000}
+{"type":"goal.update","agentId":"main","turnsUsed":1,"wallClockMs":24000,"time":25000,"wallClockResumedAt":25000}
+{"type":"goal.update","agentId":"main","status":"paused","wallClockMs":30000,"time":31000}
+{"type":"goal.update","agentId":"main","status":"active","time":41000,"wallClockResumedAt":41000}

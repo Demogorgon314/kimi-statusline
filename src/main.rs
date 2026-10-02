@@ -17,9 +17,11 @@ mod probe;
 mod quota;
 mod render;
 mod session;
+mod terminal;
 mod themes;
 mod tui;
 mod update;
+mod upstream;
 
 use clap::{Parser, Subcommand};
 use config::{Config, SegmentId};
@@ -86,6 +88,31 @@ enum Cmd {
     /// Background git status probe, spawned by the status line
     #[command(hide = true)]
     ProbeGit {
+        #[arg(long)]
+        cwd: String,
+    },
+    /// Background pull request lookup
+    #[command(hide = true)]
+    ProbePr {
+        #[arg(long)]
+        cwd: String,
+        #[arg(long)]
+        branch: String,
+    },
+    /// Background task file scan
+    #[command(hide = true)]
+    ProbeTasks {
+        #[arg(long)]
+        session_dir: std::path::PathBuf,
+    },
+    /// Background session discovery and wire parsing
+    #[command(hide = true)]
+    ProbeSession {
+        #[arg(long)]
+        session_id: String,
+    },
+    #[command(hide = true)]
+    ProbeDance {
         #[arg(long)]
         cwd: String,
     },
@@ -157,6 +184,22 @@ fn main() {
         }
         Some(Cmd::ProbeGit { cwd }) => {
             let _ = probe::refresh_git(&cwd);
+            Ok(())
+        }
+        Some(Cmd::ProbePr { cwd, branch }) => {
+            let _ = probe::refresh_pr(&cwd, &branch);
+            Ok(())
+        }
+        Some(Cmd::ProbeTasks { session_dir }) => {
+            probe::refresh_tasks(&session_dir);
+            Ok(())
+        }
+        Some(Cmd::ProbeSession { session_id }) => {
+            session::refresh(&session_id);
+            Ok(())
+        }
+        Some(Cmd::ProbeDance { cwd }) => {
+            probe::refresh_dance(&cwd);
             Ok(())
         }
         Some(Cmd::Preview {

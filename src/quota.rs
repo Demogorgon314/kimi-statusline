@@ -18,8 +18,6 @@ const DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 const GLOBAL_BASE_URL: &str = "https://api.kimi.ai/coding/v1";
 const DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
 const DEFAULT_KEY: &str = "oauth/kimi-code";
-/// Don't spawn another fetch while one may still be running.
-const FETCH_LOCK_S: f64 = 20.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
@@ -48,16 +46,8 @@ struct Cache {
     error: Option<String>,
 }
 
-fn cache_path() -> PathBuf {
-    paths::cache_dir().join("quota.json")
-}
-
-fn lock_path() -> PathBuf {
-    paths::cache_dir().join("quota.lock")
-}
-
-fn read_cache() -> Cache {
-    std::fs::read(cache_path())
+fn read_cache(path: &std::path::Path) -> Cache {
+    std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
@@ -66,31 +56,37 @@ fn read_cache() -> Cache {
 /// After a failed fetch, retry this soon rather than waiting a full `ttl`.
 const RETRY_AFTER_ERROR_S: f64 = 15.0;
 
-fn mtime_secs(path: &std::path::Path) -> Option<f64> {
-    let m = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
-}
-
-/// Cached quota; kicks off a background refresh when it is due:
-/// - the cache is older than `ttl`, or
-/// - the last attempt failed and either `RETRY_AFTER_ERROR_S` passed or
-///   Kimi Code has since rewritten the credentials (a refreshed token
-///   usually fixes an "expired" failure immediately).
+/// Cache scope includes the endpoint, credential slot and token fingerprint.
+/// Token files have no stable account ID, so rotation invalidates the cache
+/// conservatively too. Missing/revoked credentials never display old quota.
 pub fn get(ttl: f64) -> Option<Quota> {
-    let cache = read_cache();
+    let auth = Auth::load(login()).ok()?;
+    let path = auth.cache_path();
+    let mut cache = read_cache(&path);
     let now = paths::now_secs();
-    let failed = cache.error.is_some() || cache.v.is_none();
-    let creds_changed = failed && mtime_secs(&login().credential).is_some_and(|m| m > cache.t);
-    let due =
-        now - cache.t >= ttl || (failed && (creds_changed || now - cache.t >= RETRY_AFTER_ERROR_S));
+    let due = now - cache.t
+        >= if cache.error.is_some() || cache.v.is_none() {
+            RETRY_AFTER_ERROR_S
+        } else {
+            ttl
+        };
     if due {
-        let lock_age = std::fs::read_to_string(lock_path())
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .map_or(f64::MAX, |t| now - t);
-        if lock_age > FETCH_LOCK_S {
-            let _ = paths::write_atomic(&lock_path(), now.to_string().as_bytes());
-            paths::spawn_self(&["fetch-quota"]);
+        if let Some(_guard) = paths::lock(&path.with_extension("lock"), false) {
+            // Another renderer may have scheduled a fetch before we locked.
+            cache = read_cache(&path);
+            if now - cache.t
+                >= if cache.error.is_some() || cache.v.is_none() {
+                    RETRY_AFTER_ERROR_S
+                } else {
+                    ttl
+                }
+            {
+                cache.t = now;
+                if let Ok(data) = serde_json::to_vec(&cache) {
+                    let _ = paths::write_atomic(&path, &data);
+                }
+                paths::spawn_self(&["fetch-quota"]);
+            }
         }
     }
     let fetched_at = cache.fetched_at;
@@ -100,8 +96,12 @@ pub fn get(ttl: f64) -> Option<Quota> {
 /// `fetch-quota`: one request, result into the cache. Errors are recorded
 /// next to the last good value instead of replacing it.
 pub fn fetch_and_store() -> Result<Quota, String> {
-    let result = fetch();
-    let mut cache = read_cache();
+    let auth = Auth::load(login())?;
+    let path = auth.cache_path();
+    let _guard =
+        paths::lock(&path.with_extension("lock"), true).ok_or("cannot lock quota cache")?;
+    let result = fetch(&auth);
+    let mut cache = read_cache(&path);
     cache.t = paths::now_secs();
     match &result {
         Ok(q) => {
@@ -112,9 +112,8 @@ pub fn fetch_and_store() -> Result<Quota, String> {
         Err(e) => cache.error = Some(e.clone()),
     }
     if let Ok(data) = serde_json::to_vec(&cache) {
-        let _ = paths::write_atomic(&cache_path(), &data);
+        let _ = paths::write_atomic(&path, &data);
     }
-    let _ = std::fs::remove_file(lock_path());
     paths::debug(&format!("fetch-quota: {:?}", result.as_ref().map(|_| "ok")));
     result.map(|q| Quota {
         fetched_at: cache.fetched_at,
@@ -124,12 +123,53 @@ pub fn fetch_and_store() -> Result<Quota, String> {
 
 /// Last fetch error, for `kimi-statusline quota` diagnostics.
 pub fn last_error() -> Option<String> {
-    read_cache().error
+    read_cache(&Auth::load(login()).ok()?.cache_path()).error
 }
 
 struct Login {
     base_url: String,
     credential: PathBuf,
+}
+
+struct Auth {
+    login: Login,
+    token: String,
+    expires_at: Option<f64>,
+}
+
+impl Auth {
+    fn load(login: Login) -> Result<Self, String> {
+        let bytes =
+            std::fs::read(&login.credential).map_err(|_| "not logged in to Kimi Code (/login)")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "unreadable credentials")?;
+        let token = value
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("no access token")?
+            .to_string();
+        let expires_at = value.get("expires_at").and_then(|v| v.as_f64());
+        Ok(Self {
+            login,
+            token,
+            expires_at,
+        })
+    }
+
+    fn cache_path(&self) -> PathBuf {
+        let mut hash = Sha256::new();
+        for part in [
+            self.login.base_url.as_bytes(),
+            self.login.credential.as_os_str().as_encoded_bytes(),
+            self.token.as_bytes(),
+        ] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
+        let digest = format!("{:x}", hash.finalize());
+        paths::cache_dir().join(format!("quota-{digest}.json"))
+    }
 }
 
 /// Where to ask and with which credential slot, following Kimi Code's
@@ -214,35 +254,18 @@ fn oauth_key(host: Option<&str>, base_url: Option<&str>) -> String {
     format!("oauth/kimi-code-env-{}", &digest[..16])
 }
 
-fn access_token(path: &PathBuf) -> Result<String, String> {
-    let v: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path).map_err(|_| "not logged in to Kimi Code (/login)".to_string())?,
-    )
-    .map_err(|_| "unreadable credentials".to_string())?;
-    let token = v
-        .get("access_token")
-        .and_then(|t| t.as_str())
-        .filter(|t| !t.is_empty())
-        .ok_or("no access token")?;
-    if let Some(exp) = v.get("expires_at").and_then(|e| e.as_f64()) {
-        if exp <= paths::now_secs() {
-            return Err("access token expired; Kimi Code refreshes it on its next request".into());
-        }
+fn fetch(auth: &Auth) -> Result<Quota, String> {
+    if auth.expires_at.is_some_and(|exp| exp <= paths::now_secs()) {
+        return Err("access token expired; Kimi Code refreshes it on its next request".into());
     }
-    Ok(token.to_string())
-}
-
-fn fetch() -> Result<Quota, String> {
-    let login = login();
-    let token = access_token(&login.credential)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(8)))
         .http_status_as_error(false)
         .build()
         .into();
     let mut res = agent
-        .get(format!("{}/usages", login.base_url))
-        .header("Authorization", format!("Bearer {token}"))
+        .get(format!("{}/usages", auth.login.base_url))
+        .header("Authorization", format!("Bearer {}", auth.token))
         .header("Accept", "application/json")
         .call()
         .map_err(|e| format!("request failed: {e}"))?;

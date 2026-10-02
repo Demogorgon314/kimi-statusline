@@ -12,6 +12,8 @@ pub struct Models {
     pub efforts: HashMap<String, String>,
     /// same keys -> whether the model declares support_efforts
     pub has_efforts: HashMap<String, bool>,
+    /// alias -> display_name, else provider model (footer.ts modelDisplayName)
+    pub payload_names: HashMap<String, String>,
 }
 
 impl Models {
@@ -41,6 +43,9 @@ impl Models {
             let supports = get("support_efforts")
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
+            if let Some(name) = display.clone().or_else(|| provider_model.clone()) {
+                m.payload_names.insert(alias.clone(), name);
+            }
             let keys: Vec<String> = [Some(alias.clone()), provider_model, display.clone()]
                 .into_iter()
                 .flatten()
@@ -56,6 +61,14 @@ impl Models {
             }
         }
         m
+    }
+
+    /// The TUI payload's model name for an alias; unknown aliases stay verbatim.
+    pub fn payload_name(&self, alias: &str) -> String {
+        self.payload_names
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| alias.to_string())
     }
 
     /// Display name for any spelling, falling back to the last path segment

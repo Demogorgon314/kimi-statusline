@@ -12,7 +12,8 @@ use crate::kimi_config::{Models, Palette, Rgb};
 use crate::payload::Payload;
 use crate::probe::{Dance, GitStatus, PullRequest};
 use crate::session::{SessionStats, Usage};
-use unicode_width::UnicodeWidthChar;
+use crate::terminal::truncate;
+pub use crate::terminal::visible_width;
 
 const CLOSE_FG: &str = "\x1b[22m\x1b[39m";
 const CLOSE_BG: &str = "\x1b[49m";
@@ -293,13 +294,13 @@ fn segment(ctx: &Ctx, seg: &SegmentConfig, compact: bool) -> Option<Vec<Span>> {
             if p.model.is_empty() {
                 return None;
             }
-            let name = ctx.models.display(&p.model);
+            let name = p.model.clone();
             let supports = ctx
                 .models
                 .has_efforts
                 .get(&p.model)
                 .copied()
-                .unwrap_or(true);
+                .unwrap_or(false);
             let thinking = match &ctx.effort {
                 Some(serde_json::Value::Bool(true)) => " thinking".to_string(),
                 Some(serde_json::Value::String(e)) if e == "on" || (!supports && e != "off") => {
@@ -891,85 +892,24 @@ pub fn render(ctx: &Ctx, width: Option<usize>) -> String {
     if visible_width(&line) <= width {
         return line;
     }
-    truncate(&line, width, ctx.color)
-}
-
-fn ansi_len(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    if b.first() != Some(&0x1b) {
-        return None;
-    }
-    match b.get(1) {
-        // CSI: ESC [ params final-byte
-        Some(b'[') => b[2..]
-            .iter()
-            .position(|c| (0x40..=0x7e).contains(c))
-            .map(|i| i + 3),
-        // OSC: ESC ] ... BEL | ESC \
-        Some(b']') => {
-            let mut i = 2;
-            while i < b.len() {
-                if b[i] == 0x07 {
-                    return Some(i + 1);
-                }
-                if b[i] == 0x1b && b.get(i + 1) == Some(&b'\\') {
-                    return Some(i + 2);
-                }
-                i += 1;
-            }
-            Some(b.len())
-        }
-        _ => Some(1),
-    }
-}
-
-/// Terminal columns of a rendered line: escapes are zero-width, East Asian
-/// wide characters count 2.
-pub fn visible_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut i = 0;
-    while i < s.len() {
-        if let Some(n) = ansi_len(&s[i..]) {
-            i += n;
-            continue;
-        }
-        let ch = s[i..].chars().next().unwrap_or(' ');
-        w += ch.width().unwrap_or(0);
-        i += ch.len_utf8();
-    }
-    w
-}
-
-fn truncate(s: &str, width: usize, color: bool) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    let mut i = 0;
-    while i < s.len() {
-        if let Some(n) = ansi_len(&s[i..]) {
-            out.push_str(&s[i..i + n]);
-            i += n;
-            continue;
-        }
-        let ch = s[i..].chars().next().unwrap_or(' ');
-        let w = ch.width().unwrap_or(0);
-        if used + w + 1 > width {
-            break;
-        }
-        out.push(ch);
-        used += w;
-        i += ch.len_utf8();
-    }
-    out.push('…');
-    if color {
-        out.push_str(CLOSE_FG);
-        out.push_str(CLOSE_BG);
-    }
-    out
+    truncate(&line, width)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_model_preserves_display_name_and_unknown_effort_capability() {
+        let (mut ctx, _) = tps_ctx(0.0, false);
+        ctx.payload.model = "kimi-code/k3".into();
+        ctx.effort = Some(serde_json::json!("high"));
+        ctx.models = Models::default();
+        ctx.config.segments.retain(|s| s.id == SegmentId::Model);
+        let line = render(&ctx, None);
+        assert!(line.contains("kimi-code/k3"), "{line}");
+        assert!(!line.contains("high"), "{line}");
+    }
 
     fn tps_ctx(age_secs: f64, hide_when_stale: bool) -> (Ctx, SegmentConfig) {
         let mut config = crate::themes::get("kimi");
@@ -990,6 +930,7 @@ mod tests {
             end: (now - age_secs) * 1000.0,
             output: 420,
             ttft: 0.0,
+            anchored: true,
         });
         let ctx = Ctx {
             payload: Payload::default(),
@@ -1111,10 +1052,7 @@ mod tests {
         assert_eq!(visible_width("\x1b[38;2;1;2;3mab\x1b[22m\x1b[39m"), 2);
         assert_eq!(visible_width("缓存"), 4);
         assert_eq!(visible_width("\x1b]8;;https://x\x07PR\x1b]8;;\x07"), 2);
-        assert_eq!(
-            visible_width(&truncate("\x1b[34mabcdef\x1b[39m", 4, false)),
-            4
-        );
+        assert_eq!(visible_width(&truncate("\x1b[34mabcdef\x1b[39m", 4)), 4);
     }
 
     #[test]

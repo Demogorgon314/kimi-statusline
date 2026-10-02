@@ -15,7 +15,7 @@ struct Cached<T> {
 }
 
 /// Fresh cached value, or (stale value, needs refresh).
-fn cached<T: DeserializeOwned>(name: &str, ttl: f64) -> (Option<T>, bool) {
+pub(crate) fn cached<T: DeserializeOwned>(name: &str, ttl: f64) -> (Option<T>, bool) {
     let path = paths::cache_dir().join(name);
     let Ok(bytes) = std::fs::read(path) else {
         return (None, true);
@@ -29,7 +29,7 @@ fn cached<T: DeserializeOwned>(name: &str, ttl: f64) -> (Option<T>, bool) {
     }
 }
 
-fn store<T: Serialize>(name: &str, v: &T) {
+pub(crate) fn store<T: Serialize>(name: &str, v: &T) {
     if let Ok(data) = serde_json::to_vec(&Cached {
         t: paths::now_secs(),
         v,
@@ -41,6 +41,12 @@ fn store<T: Serialize>(name: &str, v: &T) {
 /// Run a command with a hard deadline; None on failure, nonzero exit or
 /// timeout (the child is killed).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let deadline = Instant::now() + timeout;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -48,26 +54,44 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<String> 
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
         let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut stdout, &mut s);
-        s
+        let result = stdout.read_to_string(&mut s);
+        let _ = tx.send(result.is_ok().then_some(s));
     });
-    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = reader.join().ok()?;
-                return status.success().then_some(out);
+                // A descendant can retain stdout after its parent exits.
+                // Joining the reader without a deadline would hang forever.
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(out) => return out.filter(|_| status.success()),
+                    Err(_) => break,
+                }
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            _ => break,
         }
     }
+    #[cfg(unix)]
+    // SAFETY: this process group was created for this child only.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +175,7 @@ fn probe_git(cwd: &str) -> Option<GitStatus> {
 /// value. The status line runs this as the detached `probe-git` subcommand.
 pub fn refresh_git(cwd: &str) -> Option<GitStatus> {
     let name = git_cache_name(cwd);
+    let _guard = paths::lock(&paths::cache_dir().join(&name).with_extension("lock"), true)?;
     let value = probe_git(cwd).or_else(|| cached::<Option<GitStatus>>(&name, GIT_TTL).0.flatten());
     store(&name, &value);
     value
@@ -172,10 +197,26 @@ pub fn git_status(cwd: &str, live: bool) -> Option<GitStatus> {
     if !live {
         return refresh_git(cwd);
     }
-    // stamp first so the runs before the child finishes don't spawn more
-    store(&name, &prev);
-    paths::spawn_self(&["probe-git", "--cwd", cwd]);
+    schedule_probe(&name, GIT_TTL, &prev, &["probe-git", "--cwd", cwd]);
     prev
+}
+
+/// Stamp while holding the same OS lock as the worker. Concurrent renderers
+/// either see the fresh stamp or the running worker and keep using the cache.
+pub(crate) fn schedule_probe<T: Serialize + DeserializeOwned>(
+    name: &str,
+    ttl: f64,
+    value: &T,
+    args: &[&str],
+) {
+    let Some(_guard) = paths::lock(&paths::cache_dir().join(name).with_extension("lock"), false)
+    else {
+        return;
+    };
+    if cached::<T>(name, ttl).1 {
+        store(name, value);
+        paths::spawn_self(args);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,14 +227,41 @@ const TASKS_TTL: f64 = 2.0;
 
 /// (bash, agent) running background-task counts from
 /// `agents/*/tasks/{bash,agent}-*.json`.
-pub fn running_tasks(session_dir: &Path) -> (u32, u32) {
-    let name = format!(
+fn tasks_cache_name(session_dir: &Path) -> String {
+    format!(
         "tasks-{}.json",
         paths::short_hash(&session_dir.to_string_lossy())
-    );
-    if let (Some(v), false) = cached::<(u32, u32)>(&name, TASKS_TTL) {
-        return v;
+    )
+}
+
+pub fn running_tasks(session_dir: &Path, live: bool) -> (u32, u32) {
+    let name = tasks_cache_name(session_dir);
+    let (value, stale) = cached::<(u32, u32)>(&name, TASKS_TTL);
+    let value = value.unwrap_or_default();
+    if stale {
+        if !live {
+            return refresh_tasks(session_dir);
+        }
+        schedule_probe(
+            &name,
+            TASKS_TTL,
+            &value,
+            &[
+                "probe-tasks",
+                "--session-dir",
+                &session_dir.to_string_lossy(),
+            ],
+        );
     }
+    value
+}
+
+pub fn refresh_tasks(session_dir: &Path) -> (u32, u32) {
+    let name = tasks_cache_name(session_dir);
+    let Some(_guard) = paths::lock(&paths::cache_dir().join(&name).with_extension("lock"), true)
+    else {
+        return (0, 0);
+    };
     let (mut bash, mut agent) = (0, 0);
     for agent_dir in crate::session::read_dirs(&session_dir.join("agents")) {
         let Ok(rd) = std::fs::read_dir(agent_dir.join("tasks")) else {
@@ -351,13 +419,6 @@ pub struct PullRequest {
     pub url: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct PrCache {
-    t: f64,
-    branch: String,
-    v: Option<PullRequest>,
-}
-
 fn which(cmd: &str) -> Option<std::path::PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &[".exe", ".cmd", ""]
@@ -371,78 +432,47 @@ fn which(cmd: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The branch's open PR. `gh` needs a network round trip (upstream allows it
-/// 5s), far past our 300ms, so it is spawned detached with stdout aimed at a
-/// side file, and a later run adopts the answer. The stale value keeps
-/// rendering meanwhile, and a value is only trusted for the branch it was
-/// fetched on.
+fn pr_cache_name(cwd: &str, branch: &str) -> String {
+    format!(
+        "pr-{}-{}.json",
+        paths::short_hash(cwd),
+        paths::short_hash(branch)
+    )
+}
+
+/// The worker uses a fixed branch, a deadline and an OS lock; switching
+/// branches while gh runs cannot publish an answer under the wrong branch.
 pub fn pull_request(cwd: &str, branch: &str) -> Option<PullRequest> {
-    let dir = paths::cache_dir();
-    let key = paths::short_hash(cwd);
-    let path = dir.join(format!("pr-{key}.json"));
-    let out = dir.join(format!("pr-{key}-{}.out", paths::short_hash(branch)));
-
-    let cached: Option<PrCache> = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .filter(|c: &PrCache| c.branch == branch);
-    let mut value = cached.as_ref().and_then(|c| c.v.clone());
-    let write = |v: &Option<PullRequest>| {
-        let c = PrCache {
-            t: paths::now_secs(),
-            branch: branch.to_string(),
-            v: v.clone(),
-        };
-        if let Ok(data) = serde_json::to_vec(&c) {
-            let _ = paths::write_atomic(&path, &data);
-        }
-    };
-
-    if let Ok(meta) = std::fs::metadata(&out) {
-        let finished = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0.0, |d| d.as_secs_f64());
-        let parsed = std::fs::read(&out)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<PullRequest>(&b).ok());
-        // gh writes its one-line JSON as it exits: parseable means done; an
-        // old unparseable file means no PR / gh failed; a young one is still
-        // in flight
-        if parsed.is_some() || paths::now_secs() - finished > 30.0 {
-            let _ = std::fs::remove_file(&out);
-            if cached.as_ref().is_none_or(|c| finished >= c.t) {
-                value = parsed;
-                write(&value);
-                return value;
-            }
-        }
+    let name = pr_cache_name(cwd, branch);
+    let (value, stale) = cached::<Option<PullRequest>>(&name, PR_TTL);
+    let value = value.flatten();
+    if stale {
+        schedule_probe(
+            &name,
+            PR_TTL,
+            &value,
+            &["probe-pr", "--cwd", cwd, "--branch", branch],
+        );
     }
-    if cached
-        .as_ref()
-        .is_some_and(|c| paths::now_secs() - c.t < PR_TTL)
-    {
-        return value;
-    }
-    // stamp first so concurrent runs don't all spawn gh
-    write(&value);
-    spawn_gh(cwd, &out);
     value
 }
 
-fn spawn_gh(cwd: &str, out: &Path) {
-    let Some(gh) = which("gh") else { return };
-    let Ok(file) = std::fs::File::create(out) else {
-        return;
-    };
-    let mut cmd = Command::new(gh);
-    cmd.args(["pr", "view", "--json", "number,url"])
-        .current_dir(cwd)
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_PROMPT_DISABLED", "1");
-    paths::detach(&mut cmd).stdout(file);
-    let _ = cmd.spawn();
+pub fn refresh_pr(cwd: &str, branch: &str) -> Option<PullRequest> {
+    let name = pr_cache_name(cwd, branch);
+    let _guard = paths::lock(&paths::cache_dir().join(&name).with_extension("lock"), true)?;
+    let value = which("gh").and_then(|gh| {
+        let output = run_with_timeout(
+            Command::new(gh)
+                .args(["pr", "view", "--json", "number,url", "--", branch])
+                .current_dir(cwd)
+                .env("GH_NO_UPDATE_NOTIFIER", "1")
+                .env("GH_PROMPT_DISABLED", "1"),
+            Duration::from_secs(5),
+        )?;
+        serde_json::from_str::<PullRequest>(&output).ok()
+    });
+    store(&name, &value);
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +482,7 @@ fn spawn_gh(cwd: &str, out: &Path) {
 /// Flow window of upstream's DANCE_FLOW_MS.
 pub const DANCE_FLOW_S: f64 = 3.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dance {
     /// rainbow flowing (first ~3s after any /dance)
     Flow,
@@ -498,6 +528,34 @@ fn scan_dance(scan: &mut DanceScan, chunk: &str) {
 /// History this far back is enough for a first scan; later runs only read
 /// what was appended.
 const DANCE_FIRST_SCAN: u64 = 1 << 20;
+
+fn dance_view_name(cwd: &str) -> String {
+    format!("dance-view-{}.json", paths::short_hash(cwd))
+}
+
+pub fn cached_dance(cwd: &str, live: bool) -> Option<Dance> {
+    if cwd.is_empty() {
+        return None;
+    }
+    if !live {
+        return refresh_dance(cwd);
+    }
+    let name = dance_view_name(cwd);
+    let (value, stale) = cached::<Option<Dance>>(&name, 1.0);
+    let value = value.flatten();
+    if stale {
+        schedule_probe(&name, 1.0, &value, &["probe-dance", "--cwd", cwd]);
+    }
+    value
+}
+
+pub fn refresh_dance(cwd: &str) -> Option<Dance> {
+    let name = dance_view_name(cwd);
+    let _guard = paths::lock(&paths::cache_dir().join(&name).with_extension("lock"), true)?;
+    let value = dance_state(cwd);
+    store(&name, &value);
+    value
+}
 
 /// Reconstruct the /dance state from the per-cwd input history
 /// (`<home>/user-history/md5(workDir).jsonl`), where every submitted slash
@@ -574,6 +632,23 @@ pub fn dance_state(cwd: &str) -> Option<Dance> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_covers_running_children_and_inherited_stdout() {
+        for script in ["sleep 30", "sleep 30 & exit 0"] {
+            let start = Instant::now();
+            let result = run_with_timeout(
+                Command::new("sh").args(["-c", script]),
+                Duration::from_millis(100),
+            );
+            assert!(result.is_none());
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "reader exceeded deadline"
+            );
+        }
+    }
 
     fn entry(content: &str) -> String {
         format!("{}\n", serde_json::json!({ "content": content }))

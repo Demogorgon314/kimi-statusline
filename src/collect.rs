@@ -8,8 +8,8 @@ use crate::{paths, probe, session};
 use std::path::Path;
 use std::time::Duration;
 
-/// `live`: running as the TUI's status line, where nothing slow (spawned
-/// probes) may run inline under the 300ms cap.
+/// Live renders read cached snapshots and schedule workers; preview refreshes
+/// session data synchronously because it has no TUI process deadline.
 pub fn collect(payload: Payload, config: Config, live: bool) -> Ctx {
     let models = Models::load();
     let palette_name = (!config.style.palette.is_empty()).then_some(config.style.palette.as_str());
@@ -17,42 +17,29 @@ pub fn collect(payload: Payload, config: Config, live: bool) -> Ctx {
     let now = paths::now_secs();
     let wants = |id: SegmentId| config.segment(id).is_some_and(|s| s.enabled);
 
-    let session_dir = session::find_session_dir(&payload.session_id);
-    paths::debug(&format!(
-        "session={:?} dir={session_dir:?}",
-        payload.session_id
-    ));
-
-    let mut stats = None;
-    let mut goal = None;
-    let mut session_created = None;
-    if let Some(dir) = &session_dir {
-        // Bind stats to the resolved directory. Older versions could cache
-        // the latest session's stats under an unresolved, different ID.
-        let cache_key = dir.to_string_lossy().into_owned();
-        let prior = session::load_cache(&cache_key);
-        let mut st = session::parse_session(dir, prior.clone());
-
-        let state = session::read_json(&dir.join("state.json"));
-        session_created = state
-            .as_ref()
-            .and_then(|s| s.get("createdAt")?.as_f64())
-            .map(|ms| ms / 1000.0);
-        goal = state
-            .and_then(|s| s.get("custom")?.get("goal").cloned())
-            .filter(|g| g.is_object());
-        // anchor for a live goal's ticking clock: when this snapshot was
-        // first seen (upstream's goalObservedAtMs)
-        let key = goal.as_ref().map(|g| g.to_string());
-        if key != st.goal_key || (key.is_some() && st.goal_seen_at.is_none()) {
-            st.goal_seen_at = key.as_ref().map(|_| now);
-            st.goal_key = key;
-        }
-        if prior.as_ref() != Some(&st) {
-            session::save_cache(&cache_key, &st);
-        }
-        stats = Some(st);
-    }
+    let needs_stats = [
+        SegmentId::Usage,
+        SegmentId::Subagent,
+        SegmentId::Tps,
+        SegmentId::Mode,
+        SegmentId::Model,
+        SegmentId::Goal,
+    ]
+    .into_iter()
+    .any(wants);
+    let needs_session = needs_stats || wants(SegmentId::Session) || wants(SegmentId::Tasks);
+    let view = if needs_session {
+        session::snapshot(&payload.session_id, live)
+    } else {
+        session::Snapshot::default()
+    };
+    let session_dir = view.dir;
+    let stats = view.stats;
+    let session_created = view.created;
+    let goal = stats
+        .as_ref()
+        .and_then(|s| s.goal.as_ref())
+        .and_then(|g| serde_json::to_value(g).ok());
 
     let effort = stats.as_ref().and_then(|s| s.effort.clone()).or_else(|| {
         models
@@ -62,7 +49,7 @@ pub fn collect(payload: Payload, config: Config, live: bool) -> Ctx {
             .map(serde_json::Value::String)
     });
     let tasks = match (&session_dir, wants(SegmentId::Tasks)) {
-        (Some(dir), true) => probe::running_tasks(dir),
+        (Some(dir), true) => probe::running_tasks(dir, live),
         _ => (0, 0),
     };
 
@@ -78,7 +65,7 @@ pub fn collect(payload: Payload, config: Config, live: bool) -> Ctx {
         _ => None,
     };
     let dance = wants(SegmentId::Model)
-        .then(|| probe::dance_state(&payload.cwd))
+        .then(|| probe::cached_dance(&payload.cwd, live))
         .flatten();
 
     let quota = config
@@ -151,6 +138,8 @@ pub fn sample_payload(cwd: &str, session_id: Option<String>) -> Payload {
     if p.model.is_empty() {
         p.model = "kimi-code/k3".into();
     }
+    // Preview synthesizes the TUI payload, whose model is already a display name.
+    p.model = Models::load().payload_name(&p.model);
     p
 }
 

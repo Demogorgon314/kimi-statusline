@@ -6,89 +6,138 @@
 //! and the totals they produced live in a per-session cache file.
 
 use crate::paths;
+use crate::probe;
+pub use crate::upstream::wire::Usage;
+use crate::upstream::wire::{record_type, LoopEvent, RecordFields, StepEnd, WANTED};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CACHE_VERSION: u32 = 3;
-/// Most bytes one wire may contribute per run; a huge first sighting is spread
-/// over several refreshes instead of blowing the 300ms cap (a killed run saves
-/// nothing, so it would re-read the same bytes forever).
+const CACHE_VERSION: u32 = 5;
+/// Bound background catch-up memory and work per refresh. The foreground
+/// never opens wires, so slow filesystem reads cannot consume its TUI budget.
 const MAX_TAIL_BYTES: u64 = 16 * 1024 * 1024;
 const PARSE_BUDGET: Duration = Duration::from_millis(120);
+// Below the TUI's one-second cadence so a worker finishing just after one
+// render does not suppress the next refresh for an additional second.
+const SNAPSHOT_TTL: f64 = 0.5;
+
+/// Small published view: foreground reads never enumerate sessions or wires.
+/// Parser cursors stay in the separate per-directory cache.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub dir: Option<PathBuf>,
+    pub stats: Option<SessionStats>,
+    pub created: Option<f64>,
+}
+
+fn snapshot_name(id: &str) -> String {
+    format!(
+        "session-view-v{CACHE_VERSION}-{}.json",
+        paths::short_hash(id)
+    )
+}
+
+pub fn snapshot(id: &str, live: bool) -> Snapshot {
+    if id.is_empty() {
+        return Snapshot::default();
+    }
+    if !live {
+        return refresh(id);
+    }
+    let name = snapshot_name(id);
+    let (value, stale) = probe::cached::<Snapshot>(&name, SNAPSHOT_TTL);
+    let value = value.unwrap_or_default();
+    if stale {
+        probe::schedule_probe(
+            &name,
+            SNAPSHOT_TTL,
+            &value,
+            &["probe-session", "--session-id", id],
+        );
+    }
+    value
+}
+
+pub fn refresh(id: &str) -> Snapshot {
+    if id.is_empty() {
+        return Snapshot::default();
+    }
+    let name = snapshot_name(id);
+    let Some(_guard) = paths::lock(&paths::cache_dir().join(&name).with_extension("lock"), true)
+    else {
+        return Snapshot::default();
+    };
+    let mut view = Snapshot::default();
+    if let Some(dir) = find_session_dir(id) {
+        let key = dir.to_string_lossy();
+        let Some(_parser_guard) = paths::lock(&cache_path(&key).with_extension("lock"), true)
+        else {
+            return view;
+        };
+        let mut stats = parse_session_until(&dir, load_cache(&key), Instant::now() + PARSE_BUDGET);
+        let state = read_json(&dir.join("state.json"));
+        view.created = state
+            .as_ref()
+            .and_then(|s| s.get("createdAt")?.as_f64())
+            .map(|ms| ms / 1000.0);
+        normalize_goal(&mut stats, state.as_ref());
+        save_cache(&key, &stats);
+        stats.files.clear();
+        view.stats = Some(stats);
+        view.dir = Some(dir);
+    }
+    probe::store(&name, &view);
+    view
+}
+
+/// Both historical metadata and wire events publish one goal and clock anchor.
+fn normalize_goal(stats: &mut SessionStats, state: Option<&serde_json::Value>) {
+    if !stats.goal_events_seen {
+        let legacy = state.and_then(|s| s.get("custom")?.get("goal"));
+        let key = legacy.map(|g| g.to_string());
+        stats.goal = legacy.and_then(|g| serde_json::from_value(g.clone()).ok());
+        if key != stats.goal_key || (key.is_some() && stats.goal_seen_at.is_none()) {
+            stats.goal_seen_at = key.as_ref().map(|_| paths::now_secs());
+        }
+        if let Some(goal) = stats.goal.as_mut().filter(|g| g.status == "active") {
+            goal.wall_clock_resumed_at = goal
+                .wall_clock_resumed_at
+                .or_else(|| stats.goal_seen_at.map(|s| s * 1000.0));
+        }
+        stats.goal_key = key;
+    }
+    stats.goal_seen_at = stats
+        .goal
+        .as_ref()
+        .and_then(|g| g.wall_clock_resumed_at)
+        .map(|ms| ms / 1000.0);
+}
 
 /// Reserved aliases standing in for a real model; mapped back through the same
 /// agent's llm.request records.
 const PLACEHOLDER_ALIASES: [&str; 3] = ["__secondary__", "secondary", "primary"];
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Usage {
-    pub input_other: u64,
-    pub output: u64,
-    pub input_cache_read: u64,
-    pub input_cache_creation: u64,
-}
-
-impl Usage {
-    pub fn input(&self) -> u64 {
-        self.input_other + self.input_cache_read + self.input_cache_creation
-    }
-
-    pub fn add(&mut self, o: &Usage) {
-        self.input_other += o.input_other;
-        self.output += o.output;
-        self.input_cache_read += o.input_cache_read;
-        self.input_cache_creation += o.input_cache_creation;
-    }
-
-    /// Cache hit rate in percent; None before any input.
-    pub fn cache_rate(&self) -> Option<f64> {
-        let total = self.input();
-        (total > 0).then(|| self.input_cache_read as f64 / total as f64 * 100.0)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.input() == 0 && self.output == 0
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Cursor {
+    /// Hash of the open handle's dev/inode (Unix) or volume/file index (Windows).
+    identity: Option<u64>,
     offset: u64,
     /// The offset landed inside an over-long line; skip to the next newline.
     mid: bool,
     bound: Option<String>,
     real: Option<String>,
+    stream_end: Option<StreamEnd>,
 }
 
-/// `context.append_loop_event` wrapping a `step.end`: Kimi Code's own
-/// measurement of the model call that just finished (see upstream
-/// human/timing/plugin.ts).
-#[derive(Deserialize)]
-struct LoopEvent {
-    #[serde(default)]
-    time: Option<f64>,
-    #[serde(default)]
-    event: Option<StepEnd>,
-}
-
-#[derive(Deserialize)]
-struct StepEnd {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    usage: Option<Usage>,
-    /// first streamed delta → stream done: the decode phase only
-    #[serde(rename = "llmStreamDurationMs", default)]
-    stream_ms: Option<f64>,
-    /// request sent → first delta (queueing + prefill)
-    #[serde(rename = "llmFirstTokenLatencyMs", default)]
-    ttft_ms: Option<f64>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct StreamEnd {
+    time: f64,
+    usage: Usage,
 }
 
 /// One model call, timed by Kimi Code: when its stream started and ended
@@ -101,6 +150,9 @@ pub struct Call {
     pub output: u64,
     /// time to first token, ms
     pub ttft: f64,
+    /// Only calls paired with a turn's usage record have a stream end anchor.
+    #[serde(default)]
+    pub anchored: bool,
 }
 
 impl Call {
@@ -142,14 +194,26 @@ impl Speed {
     /// tok/s: the burst size, not the model's speed.
     const MIN_STREAM_MS: f64 = 1000.0;
 
-    fn record_step(&mut self, agent: &str, step: &StepEnd, line_time: Option<f64>) {
-        let (Some(stream_ms), Some(usage), Some(end)) = (step.stream_ms, step.usage, line_time)
+    fn record_step(
+        &mut self,
+        agent: &str,
+        step: &StepEnd,
+        line_time: Option<f64>,
+        stream_end: Option<StreamEnd>,
+    ) {
+        let (Some(stream_ms), Some(usage), Some(observed_at)) =
+            (step.stream_ms, step.usage, line_time)
         else {
             return;
         };
         if stream_ms < Self::MIN_STREAM_MS || usage.output == 0 {
             return;
         }
+        // step.end is emitted after tools complete. usage.record is emitted
+        // when the LLM returns, before those tools run. Legacy records without
+        // that anchor still provide a rate, but cannot establish overlap.
+        let anchor = stream_end.filter(|s| s.usage == usage && s.time <= observed_at);
+        let end = anchor.as_ref().map_or(observed_at, |s| s.time);
         self.output += usage.output;
         self.secs += stream_ms / 1000.0;
         // agents are parsed one file at a time, so calls arrive out of
@@ -163,6 +227,7 @@ impl Speed {
                 end,
                 output: usage.output,
                 ttft: step.ttft_ms.unwrap_or(0.0),
+                anchored: anchor.is_some(),
             },
         );
         if self.recent.len() > Self::RECENT_CAP {
@@ -196,7 +261,7 @@ impl Speed {
         // touched the window would also count a main-agent call that ended
         // just before the sub-agents it spawned started.
         let mut edges: Vec<(f64, i32)> = Vec::new();
-        for c in self.recent.iter().filter(|c| c.end > from) {
+        for c in self.recent.iter().filter(|c| c.anchored && c.end > from) {
             let start = c.start.max(from);
             tokens += c.output as f64 * (c.end - start) / (c.end - c.start);
             earliest = earliest.min(start);
@@ -235,6 +300,66 @@ pub struct SessionStats {
     pub goal_key: Option<String>,
     pub goal_seen_at: Option<f64>,
     pub speed: Speed,
+    pub goal: Option<GoalState>,
+    /// A cleared event-based goal must not fall back to stale legacy metadata.
+    pub goal_events_seen: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GoalState {
+    pub status: String,
+    pub turns_used: u64,
+    pub wall_clock_ms: f64,
+    pub wall_clock_resumed_at: Option<f64>,
+    #[serde(rename = "budget")]
+    pub budget_limits: serde_json::Value,
+}
+
+impl SessionStats {
+    fn apply_goal(&mut self, kind: &str, record: &serde_json::Value) {
+        if kind == "forked" && !self.goal_events_seen {
+            return;
+        }
+        self.goal_events_seen = true;
+        let resumed_at = crate::upstream::wire::goal_resumed_at(kind, record);
+        match kind {
+            "goal.create" => {
+                self.goal = Some(GoalState {
+                    status: "active".into(),
+                    wall_clock_resumed_at: resumed_at,
+                    ..Default::default()
+                })
+            }
+            "goal.clear" | "forked" => self.goal = None,
+            "goal.update" => {
+                let Some(goal) = self.goal.as_mut() else {
+                    return;
+                };
+                if let Some(status) = record.get("status").and_then(|v| v.as_str()) {
+                    if goal.status != status {
+                        goal.status = status.to_string();
+                        goal.wall_clock_resumed_at = None;
+                    }
+                }
+                if goal.status == "active" {
+                    if let Some(at) = resumed_at {
+                        goal.wall_clock_resumed_at = Some(at);
+                    }
+                }
+                if let Some(turns) = record.get("turnsUsed").and_then(|v| v.as_u64()) {
+                    goal.turns_used = turns;
+                }
+                if let Some(ms) = record.get("wallClockMs").and_then(|v| v.as_f64()) {
+                    goal.wall_clock_ms = ms;
+                }
+                if let Some(budget) = record.get("budgetLimits") {
+                    goal.budget_limits = budget.clone();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,38 +368,87 @@ pub struct SessionStats {
 
 /// Resolve only the requested session. Startup can have an empty ID or an
 /// ID whose directory has not been created yet; neither means "resume latest".
+#[derive(Default, Serialize, Deserialize)]
+struct Location {
+    dir: Option<PathBuf>,
+    offset: u64,
+    mid: bool,
+}
+
 pub fn find_session_dir(session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
     }
     let home = paths::kimi_home();
-    if let Ok(f) = File::open(home.join("session_index.jsonl")) {
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
-            if !line.contains(session_id) {
-                continue;
-            }
-            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if rec.get("sessionId").and_then(|v| v.as_str()) == Some(session_id) {
-                if let Some(dir) = rec.get("sessionDir").and_then(|v| v.as_str()) {
-                    let dir = PathBuf::from(dir);
-                    if dir.is_dir() {
-                        return Some(dir);
+    let cache = paths::cache_dir().join(format!("location-{}.json", paths::short_hash(session_id)));
+    let mut location: Location = std::fs::read(&cache)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if let Some(dir) = location.dir.as_ref().filter(|d| d.is_dir()) {
+        return Some(dir.clone());
+    }
+    // A moved/deleted directory invalidates the old index cursor as well.
+    if location.dir.take().is_some() {
+        location = Location::default();
+    }
+    let index = home.join("session_index.jsonl");
+    if let Ok(size) = index.metadata().map(|m| m.len()) {
+        if size < location.offset {
+            location = Location::default();
+        }
+        while location.offset < size {
+            let (chunk, offset, mid) = read_tail(&index, location.offset, location.mid, size);
+            let chunk_start = offset - chunk.len() as u64;
+            location.offset = chunk_start;
+            location.mid = false;
+            for line in chunk.split_inclusive(|&b| b == b'\n') {
+                location.offset += line.len() as u64;
+                if !std::str::from_utf8(line).is_ok_and(|s| s.contains(session_id)) {
+                    continue;
+                }
+                let Ok(rec) = serde_json::from_slice::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if rec.get("sessionId").and_then(|v| v.as_str()) == Some(session_id) {
+                    if let Some(dir) = rec
+                        .get("sessionDir")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                    {
+                        location.dir = Some(dir);
+                        break;
                     }
+                }
+            }
+            if location.dir.is_some() || location.offset < offset {
+                break;
+            }
+            location.mid = mid;
+            if chunk.is_empty() {
+                location.offset = offset;
+                break;
+            }
+        }
+    }
+    if location.dir.is_none() {
+        'search: for name in [session_id.to_string(), format!("session_{session_id}")] {
+            let Ok(entries) = std::fs::read_dir(home.join("sessions")) else {
+                break;
+            };
+            for wd in entries.filter_map(Result::ok) {
+                let candidate = wd.path().join(&name);
+                if candidate.is_dir() {
+                    location.dir = Some(candidate);
+                    break 'search;
                 }
             }
         }
     }
-    for name in [session_id.to_string(), format!("session_{session_id}")] {
-        for wd in read_dirs(&home.join("sessions")) {
-            let candidate = wd.join(&name);
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-        }
+    if let Ok(bytes) = serde_json::to_vec(&location) {
+        let _ = paths::write_atomic(&cache, &bytes);
     }
-    None
+    location.dir.filter(|d| d.is_dir())
 }
 
 /// Select a recent session explicitly for the preview/configurator.
@@ -355,19 +529,34 @@ pub fn save_cache(session_id: &str, stats: &SessionStats) {
 // wire parsing
 // ---------------------------------------------------------------------------
 
+fn file_identity(file: &File) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let handle = same_file::Handle::from_file(file.try_clone().ok()?).ok()?;
+    // A compiler change may change this hash; that only forces a safe replay.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    handle.hash(&mut hash);
+    Some(hash.finish())
+}
+
 /// Read what was appended after `start`. Returns (complete lines, new offset,
 /// mid). A trailing partial line (writer mid-append) is left for next time.
 fn read_tail(path: &Path, start: u64, mid: bool, size: u64) -> (Vec<u8>, u64, bool) {
+    let Ok(file) = File::open(path) else {
+        return (Vec::new(), start, mid);
+    };
+    read_tail_file(&file, start, mid, size)
+}
+
+fn read_tail_file(mut file: &File, start: u64, mid: bool, size: u64) -> (Vec<u8>, u64, bool) {
     let remaining = size.saturating_sub(start);
     if remaining == 0 {
         return (Vec::new(), start, mid);
     }
     let want = remaining.min(MAX_TAIL_BYTES);
     let mut buf = Vec::with_capacity(want as usize);
-    let read = File::open(path).and_then(|mut f| {
-        f.seek(SeekFrom::Start(start))?;
-        f.take(want).read_to_end(&mut buf)
-    });
+    let read = file
+        .seek(SeekFrom::Start(start))
+        .and_then(|_| file.take(want).read_to_end(&mut buf));
     if read.is_err() {
         return (Vec::new(), start, mid);
     }
@@ -380,7 +569,7 @@ fn read_tail(path: &Path, start: u64, mid: bool, size: u64) -> (Vec<u8>, u64, bo
                 start += nl as u64 + 1;
                 chunk = &chunk[nl + 1..];
             }
-            None => return (Vec::new(), start + chunk.len() as u64, !at_eof),
+            None => return (Vec::new(), start + chunk.len() as u64, true),
         }
     }
     match chunk.iter().rposition(|&b| b == b'\n') {
@@ -392,78 +581,72 @@ fn read_tail(path: &Path, start: u64, mid: bool, size: u64) -> (Vec<u8>, u64, bo
     }
 }
 
-/// The record's own `"type"` when the line starts with it. Matching the
-/// leading key (not a substring search) keeps tool output that merely quotes
-/// a record name from being taken for the record itself.
-fn record_type(line: &[u8]) -> Option<&str> {
-    let rest = line.strip_prefix(b"{\"type\":\"")?;
-    let end = rest.iter().take(48).position(|&b| b == b'"')?;
-    std::str::from_utf8(&rest[..end]).ok()
-}
-
-const WANTED: [&str; 9] = [
-    "usage.record",
-    "profile.bind",
-    "llm.request",
-    "config.update",
-    "swarm_mode.enter",
-    "swarm_mode.exit",
-    "tower_mode.enter",
-    "tower_mode.exit",
-    "context.append_loop_event",
-];
-
-#[derive(Deserialize)]
-struct Rec {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default, rename = "modelAlias")]
-    model_alias: Option<String>,
-    #[serde(default, rename = "thinkingEffort")]
-    thinking_effort: Option<serde_json::Value>,
-    #[serde(default, rename = "thinkingLevel")]
-    thinking_level: Option<serde_json::Value>,
-    #[serde(default)]
-    usage: Option<Usage>,
-}
-
 /// Fold everything appended since `prior` into fresh stats.
+#[cfg(test)]
 pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
+    parse_session_until(dir, prior, Instant::now() + PARSE_BUDGET)
+}
+
+pub fn parse_session_until(
+    dir: &Path,
+    prior: Option<SessionStats>,
+    deadline: Instant,
+) -> SessionStats {
+    let deadline = deadline.min(Instant::now() + PARSE_BUDGET);
+    parse_session_with_budget(dir, prior, &mut || Instant::now() < deadline)
+}
+
+fn parse_session_with_budget(
+    dir: &Path,
+    prior: Option<SessionStats>,
+    has_time: &mut dyn FnMut() -> bool,
+) -> SessionStats {
     let mut st = prior.unwrap_or_default();
     st.v = CACHE_VERSION;
-    let deadline = Instant::now() + PARSE_BUDGET;
 
     let mut agents = read_dirs(&dir.join("agents"));
     // main first: it carries the mode/effort state the prefix needs
     agents.sort_by_key(|p| p.file_name().map(|n| n != "main"));
     for agent_dir in agents {
+        if !has_time() {
+            break;
+        }
         let wire = agent_dir.join("wire.jsonl");
         let agent = agent_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let is_main = agent == "main";
-        let Ok(size) = wire.metadata().map(|m| m.len()) else {
+        let Ok(file) = File::open(&wire) else {
             continue;
         };
+        let Ok(size) = file.metadata().map(|m| m.len()) else {
+            continue;
+        };
+        // Identity, length and bytes must come from the same open file: the
+        // path can be atomically replaced by wireService.ts during migration.
+        let identity = file_identity(&file);
         let mut cur = st.files.get(&agent).cloned().unwrap_or_default();
-        if size < cur.offset {
+        if size < cur.offset || (cur.offset > 0 && cur.identity != identity) {
             // truncated/replaced wire: per-file subtotals aren't kept, so
             // start the whole session over
-            paths::debug(&format!("{agent}: wire shrank, full re-parse"));
+            paths::debug(&format!("{agent}: wire replaced or shrank, full re-parse"));
             // the goal clock is anchored in wall time, not in the wires:
             // carry it over so a live goal doesn't restart from zero
-            let mut fresh = parse_session(dir, None);
+            let mut fresh = parse_session_with_budget(dir, None, has_time);
             fresh.goal_key = st.goal_key;
             fresh.goal_seen_at = st.goal_seen_at;
             return fresh;
         }
-        if size > cur.offset && Instant::now() > deadline {
-            paths::debug(&format!("{agent}: parse budget spent, resuming next run"));
-            continue;
-        }
-        let (chunk, offset, mid) = read_tail(&wire, cur.offset, cur.mid, size);
-        for line in chunk.split(|&b| b == b'\n') {
+        cur.identity = identity;
+        let (chunk, offset, mid) = read_tail_file(&file, cur.offset, cur.mid, size);
+        cur.offset = offset - chunk.len() as u64;
+        cur.mid = false;
+        for line in chunk.split_inclusive(|&b| b == b'\n') {
+            if !has_time() {
+                break;
+            }
+            cur.offset += line.len() as u64;
             let Some(kind) = record_type(line) else {
                 continue;
             };
@@ -473,21 +656,36 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
             if kind == "context.append_loop_event" {
                 // the vast majority are tool calls/results; only step.end
                 // (which carries the call's timing) is worth decoding
-                const NEEDLE: &[u8] = br#"{"type":"step.end""#;
-                if !line[..line.len().min(160)]
+                const NEEDLE: &[u8] = br#"{"type":"step."#;
+                if !line[..line.len().min(256)]
                     .windows(NEEDLE.len())
                     .any(|w| w == NEEDLE)
                 {
                     continue;
                 }
                 if let Ok(ev) = serde_json::from_slice::<LoopEvent>(line) {
-                    if let Some(step) = ev.event.filter(|e| e.kind == "step.end") {
-                        st.speed.record_step(&agent, &step, ev.time);
+                    if let Some(step) = ev.event {
+                        match step.kind.as_str() {
+                            "step.begin" => cur.stream_end = None,
+                            "step.end" => {
+                                st.speed
+                                    .record_step(&agent, &step, ev.time, cur.stream_end.take())
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 continue;
             }
             match kind {
+                "goal.create" | "goal.update" | "goal.clear" | "forked" => {
+                    if is_main {
+                        if let Ok(record) = serde_json::from_slice(line) {
+                            st.apply_goal(kind, &record);
+                        }
+                    }
+                    continue;
+                }
                 "swarm_mode.enter" | "swarm_mode.exit" => {
                     if is_main {
                         st.swarm = kind.ends_with(".enter");
@@ -502,7 +700,7 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
                 }
                 _ => {}
             }
-            let Ok(rec) = serde_json::from_slice::<Rec>(line) else {
+            let Ok(rec) = serde_json::from_slice::<RecordFields>(line) else {
                 continue;
             };
             match kind {
@@ -523,10 +721,10 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
                 }
                 "usage.record" => {
                     let Some(u) = rec.usage else { continue };
+                    if rec.usage_scope.as_deref() == Some("turn") {
+                        cur.stream_end = rec.time.map(|time| StreamEnd { time, usage: u });
+                    }
                     st.total.add(&u);
-                    // request → usage wall time covers the whole call
-                    // (time to first token included), so this is the speed
-                    // you actually experience, not the decoder's peak
                     if is_main {
                         st.main.add(&u);
                         continue;
@@ -547,8 +745,9 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
                 _ => {}
             }
         }
-        cur.offset = offset;
-        cur.mid = mid;
+        if cur.offset == offset {
+            cur.mid = mid;
+        }
         st.files.insert(agent, cur);
     }
     st
@@ -558,12 +757,180 @@ pub fn parse_session(dir: &Path, prior: Option<SessionStats>) -> SessionStats {
 mod tests {
     use super::*;
 
-    /// A step.end loop event as Kimi Code writes it: stream finished at
-    /// `end` ms after streaming for `stream` ms.
+    #[test]
+    fn upstream_generated_wires_agree_before_and_after_migration() {
+        let dir = std::env::temp_dir().join(format!("ksl-golden-{}", std::process::id()));
+        let agent = dir.join("agents/main");
+        std::fs::create_dir_all(&agent).unwrap();
+        let wire = agent.join("wire.jsonl");
+        let mut prior = None;
+        for fixture in [
+            include_str!("../tests/fixtures/wire-v1.4.jsonl"),
+            include_str!("../tests/fixtures/wire-v1.5.jsonl"),
+        ] {
+            let replacement = agent.join("replacement");
+            std::fs::write(&replacement, fixture).unwrap();
+            std::fs::rename(replacement, &wire).unwrap();
+            let mut stats = parse_session(&dir, prior);
+            normalize_goal(&mut stats, None);
+            assert_eq!(stats.total.input(), 1000);
+            assert_eq!(stats.total.output, 420);
+            assert_eq!(stats.total.cache_rate(), Some(90.0));
+            let call = stats.speed.last().unwrap();
+            assert_eq!(
+                (call.start, call.end, call.rate(), call.anchored),
+                (5000.0, 15000.0, 42.0, true)
+            );
+            let goal = stats.goal.as_ref().unwrap();
+            assert_eq!(goal.status, "active");
+            assert_eq!(goal.turns_used, 1);
+            assert_eq!(goal.budget_limits["turnBudget"], 8);
+            assert_eq!(goal.wall_clock_ms, 30000.0);
+            assert_eq!(stats.goal_seen_at, Some(41.0));
+            prior = Some(stats);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_wire_rewrite_larger_than_cursor_replays_usage_once() {
+        let dir = std::env::temp_dir().join(format!("ksl-rewrite-{}", std::process::id()));
+        let agent = dir.join("agents/main");
+        std::fs::create_dir_all(&agent).unwrap();
+        let wire = agent.join("wire.jsonl");
+        let usage = "{\"type\":\"usage.record\",\"usage\":{\"output\":7}}\n";
+        std::fs::write(&wire, usage).unwrap();
+        let first = parse_session(&dir, None);
+        assert_eq!(first.total.output, 7);
+        // Shift the old record beyond the previous offset: a size-only
+        // cursor would count it twice, producing 21 instead of 14 tokens.
+        let replacement = agent.join("replacement");
+        let header = format!(
+            "{{\"type\":\"metadata\",\"protocol_version\":\"1.5\",\"padding\":\"{}\"}}\n",
+            "x".repeat(usage.len())
+        );
+        assert!(header.len() > first.files["main"].offset as usize);
+        std::fs::write(&replacement, format!("{header}{usage}{usage}")).unwrap();
+        std::fs::rename(replacement, &wire).unwrap();
+        let replayed = parse_session(&dir, Some(first));
+        assert_eq!(replayed.total.output, 14);
+        assert_eq!(parse_session(&dir, Some(replayed)).total.output, 14);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_goal_accounting_advances_anchor_but_budget_updates_do_not() {
+        let mut st = SessionStats::default();
+        for (kind, record, anchor) in [
+            (
+                "goal.create",
+                serde_json::json!({"time":1000}),
+                Some(1000.0),
+            ),
+            (
+                "goal.update",
+                serde_json::json!({"wallClockMs":4000,"time":5000}),
+                Some(5000.0),
+            ),
+            (
+                "goal.update",
+                serde_json::json!({"budgetLimits":{"turnBudget":10},"time":6000}),
+                Some(5000.0),
+            ),
+            (
+                "goal.update",
+                serde_json::json!({"status":"paused","time":7000}),
+                None,
+            ),
+            (
+                "goal.update",
+                serde_json::json!({"status":"active","time":8000}),
+                Some(8000.0),
+            ),
+            (
+                "goal.update",
+                serde_json::json!({"status":"active","time":9000,"wallClockResumedAt":8500}),
+                Some(8500.0),
+            ),
+        ] {
+            st.apply_goal(kind, &record);
+            assert_eq!(st.goal.as_ref().unwrap().wall_clock_resumed_at, anchor);
+        }
+    }
+
+    /// Upstream records usage when the stream returns, then ends the step.
     fn step_end(end: u64, out: u64, stream: u64, ttft: u64) -> String {
-        format!(
-            r#"{{"type":"context.append_loop_event","agentId":"x","event":{{"type":"step.end","uuid":"u","step":1,"finishReason":"tool_use","usage":{{"inputOther":1,"output":{out},"inputCacheRead":0,"inputCacheCreation":0}},"llmFirstTokenLatencyMs":{ttft},"llmStreamDurationMs":{stream}}},"time":{end}}}"#
-        )
+        let usage = format!(
+            r#"{{"type":"usage.record","usageScope":"turn","usage":{{"inputOther":1,"output":{out}}},"time":{end}}}"#
+        );
+        usage
+            + "\n"
+            + &format!(
+                r#"{{"type":"context.append_loop_event","agentId":"x","event":{{"type":"step.end","uuid":"u","step":1,"finishReason":"tool_use","usage":{{"inputOther":1,"output":{out},"inputCacheRead":0,"inputCacheCreation":0}},"llmFirstTokenLatencyMs":{ttft},"llmStreamDurationMs":{stream}}},"time":{end}}}"#
+            )
+    }
+
+    #[test]
+    fn budget_stop_preserves_cursor_and_pending_stream_across_runs() {
+        let dir = std::env::temp_dir().join(format!("ksl-budget-{}", std::process::id()));
+        let agent = dir.join("agents/main");
+        std::fs::create_dir_all(&agent).unwrap();
+        let body = step_end(15000, 400, 10000, 5000) + "\n";
+        std::fs::write(agent.join("wire.jsonl"), &body).unwrap();
+        let mut checks = 0;
+        let st = parse_session_with_budget(&dir, None, &mut || {
+            checks += 1;
+            checks <= 2
+        });
+        assert_eq!(st.total.output, 400);
+        assert!(st.speed.last().is_none());
+        assert!(st.files["main"].offset < body.len() as u64);
+        let cached: SessionStats =
+            serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
+        let resumed = parse_session_with_budget(&dir, Some(cached), &mut || true);
+        assert_eq!(resumed.total.output, 400, "usage must not be counted twice");
+        assert_eq!(resumed.speed.last().unwrap().rate(), 40.0);
+        assert!(resumed.speed.last().unwrap().anchored);
+        assert_eq!(resumed.files["main"].offset, body.len() as u64);
+        let unchanged = parse_session_until(&dir, Some(resumed.clone()), Instant::now());
+        assert_eq!(unchanged, resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_timing_keeps_rate_without_inventing_parallelism() {
+        let mut speed = Speed::default();
+        let ev: LoopEvent =
+            serde_json::from_str(step_end(60000, 400, 10000, 0).lines().nth(1).unwrap()).unwrap();
+        let step = ev.event.unwrap();
+        speed.record_step("main", &step, ev.time, None);
+        speed.record_step("child", &step, ev.time, None);
+        assert_eq!(speed.last().unwrap().rate(), 40.0);
+        assert_eq!(speed.average(), Some(40.0));
+        assert!(speed.throughput(30.0).is_none());
+    }
+
+    #[test]
+    fn skipped_long_record_waits_for_its_newline_before_resuming() {
+        let path = std::env::temp_dir().join(format!("ksl-tail-{}", std::process::id()));
+        std::fs::write(&path, "unfinished tool output").unwrap();
+        let size = path.metadata().unwrap().len();
+        let (chunk, offset, mid) = read_tail(&path, 0, true, size);
+        assert!(chunk.is_empty() && mid);
+        assert_eq!(offset, size);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(file, " still the same record").unwrap();
+        writeln!(file, r#"{{"type":"usage.record","usage":{{"output":7}}}}"#).unwrap();
+        let (chunk, offset, mid) = read_tail(&path, offset, mid, path.metadata().unwrap().len());
+        assert!(chunk.starts_with(b"{\"type\":\"usage.record\""));
+        assert!(!mid);
+        assert_eq!(offset, path.metadata().unwrap().len());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

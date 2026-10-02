@@ -48,7 +48,9 @@ cargo install --git https://github.com/Demogorgon314/kimi-statusline
 kimi-statusline install
 ```
 
-Requires kimi-code ≥ 0.30.0. The installer never overwrites someone else's status line command (use `install --force`), keeps your `tui.toml` comments, and backs it up to `tui.toml.bak`.
+Requires kimi-code ≥ 0.30.0. The installer never overwrites someone else's status line command (use `install --force`), preserves comments during its edit, and backs up `tui.toml` to `tui.toml.bak`. Kimi Code may rewrite the file and discard comments when saving preferences later.
+
+On Windows, paths containing spaces or shell metacharacters use their 8.3 short names. If the filesystem does not provide a safe short path, installation reports an error; move the executable to a path without these characters and retry.
 
 </details>
 
@@ -57,7 +59,7 @@ Requires kimi-code ≥ 0.30.0. The installer never overwrites someone else's sta
 Kimi Code's footer tells you the model and the directory. It doesn't tell you:
 
 - 📊 **How many tokens the whole session burned** — main agent *and* every sub-agent — and your **cache hit rate**, colored red → green
-- ⏳ **How much of your 5-hour and 7-day quota is left**, and when it resets (`5h 42% ↻1h20m · 7d 63% ↻3d`)
+- ⏳ **How much of your 5-hour and 7-day quota is used**, and when it resets (`5h 42% ↻1h20m · 7d 63% ↻3d`)
 - 🧩 **Which sub-agent model is the expensive one**
 - 🌿 **Your git state at a glance** — diff stats, ahead/behind, and a clickable `[PR#42]`
 
@@ -79,8 +81,8 @@ Press **Ctrl+C twice within 1.5 seconds** to exit from any TUI screen. The first
 
 Kimi Code reruns the status line whenever its footer repaints — at most once a second, so clocks and countdowns pause while the TUI sits idle — and kills it after 300 ms. kimi-statusline is a single Rust binary that renders in **~10–20 ms**:
 
-- Session logs are read **incrementally** — a 100 MB session costs the same as a fresh one
-- Network calls and slow probes (quota, `gh pr view`, `git status`) run **in the background**; the status line only reads caches
+- Live rendering reads a published session snapshot. A background worker discovers sessions and reads logs **incrementally**; a cold start shows session data on a later refresh, and large uncached sessions catch up over several refreshes
+- Network calls and slow probes (quota, `gh pr view`, `git status`, task and history scans) run **in the background**; workers use process locks, and PR lookups time out after 5 seconds
 - Narrow terminal? It **compacts and drops** low-priority segments instead of getting cut off
 
 ![Adaptive width](assets/adaptive.png)
@@ -108,6 +110,8 @@ Kimi Code reruns the status line whenever its footer repaints — at most once a
 When space runs out, segments drop in this order: session → tps → git → directory → subagent → tasks → goal → context → quota → mode.
 
 TPS and usage belong to the current session: a fresh session starts empty, while resuming restores its statistics. The 5h / 7d quota belongs to your account and carries across sessions. Preview and the configurator use the latest session in the working directory.
+
+Goal badges support both current `goal.create/update/clear` events and legacy session metadata. Parallel TPS uses turn usage timestamps as stream-end anchors, excluding time spent waiting for tools. Older logs without those anchors still show individual and average speed, but do not contribute to parallel throughput.
 
 </details>
 
@@ -142,6 +146,8 @@ Kimi palette names (`primary`, `accent`, `text_dim`, `success`, `warning`, `erro
 It calls the same endpoint as Kimi Code's `/usage`, with the login Kimi Code already stores in `~/.kimi-code/credentials/`. Requests run in the background at most every `refresh_secs`.
 
 kimi-statusline never refreshes your login itself — racing Kimi Code's token rotation could log you out. If Kimi Code sits idle long enough for its token to expire, the quota holds its last value — dimmed once it is older than `stale_secs`, and shown as `–` for a window whose reset time has passed — and updates after your next message. `kimi-statusline quota` fetches it on demand.
+
+Caches are isolated by endpoint, credential slot and a token fingerprint. Logging out hides the quota immediately; changing accounts or rotating tokens starts a new cache, so the previous login's numbers are hidden until the next successful fetch. Credentials are never copied into cache files.
 
 </details>
 

@@ -43,16 +43,58 @@ fn save(doc: &DocumentMut, old: &str) -> Result<(), String> {
     paths::write_atomic(&path, new.as_bytes()).map_err(|e| e.to_string())
 }
 
-fn quote_command(exe: &str) -> String {
-    if exe.contains([' ', '\'', '"']) {
-        if cfg!(windows) {
-            format!("\"{exe}\"")
+#[cfg(not(windows))]
+fn quote_command(exe: &str) -> Result<String, String> {
+    Ok(format!("'{}'", exe.replace('\'', r"'\''")))
+}
+
+#[cfg(windows)]
+fn quote_command(exe: &str) -> Result<String, String> {
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let normalize = |s: &str| {
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
         } else {
-            format!("'{}'", exe.replace('\'', r"'\''"))
+            s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
         }
-    } else {
-        exe.to_string()
+    };
+    let safe = |s: &str| {
+        !s.chars()
+            // cmd also splits the command token at , ; =
+            .any(|c| c.is_whitespace() || "\"&|<>^()%!,;=".contains(c))
+    };
+    let path = normalize(exe);
+    if safe(&path) {
+        return Ok(path);
     }
+    // status-line-command.ts passes the command to Node spawn(cmd, /d /s /c)
+    // without windowsVerbatimArguments. Embedded quotes are escaped by libuv,
+    // so use an unquoted 8.3 path, not Rust Command's different quoting rules.
+    let wide: Vec<u16> = exe.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: input is NUL-terminated; the first call only requests the size.
+    let size = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if size > 0 {
+        let mut buffer = vec![0u16; size as usize];
+        // SAFETY: buffer holds the number of UTF-16 elements passed to Win32.
+        let written = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), size) };
+        if written > 0 && written < size {
+            let mut short = normalize(&String::from_utf16_lossy(&buffer[..written as usize]));
+            // Keep our recognizable executable name for uninstall/plugin
+            // ownership checks; only its parent directories need short names.
+            if let Some(name) = std::path::Path::new(&path).file_name() {
+                if safe(&name.to_string_lossy()) {
+                    short = std::path::Path::new(&short)
+                        .with_file_name(name)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+            if safe(&short) {
+                return Ok(short);
+            }
+        }
+    }
+    Err("Cannot install this executable path through Kimi Code's Windows shell. No shell-safe 8.3 path is available; move kimi-statusline.exe to a directory without spaces or shell metacharacters and retry.".into())
 }
 
 fn is_ours(cmd: &str) -> bool {
@@ -70,7 +112,7 @@ pub fn install(command: Option<String>, force: bool, plugin: bool) -> Result<Out
         None => {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let exe = exe.canonicalize().unwrap_or(exe);
-            let mut c = quote_command(&exe.to_string_lossy());
+            let mut c = quote_command(&exe.to_string_lossy())?;
             if plugin {
                 c += " --plugin";
             }
@@ -131,7 +173,7 @@ pub fn plugin_inactive() -> bool {
         .iter()
         .find(|r| r.get("id").and_then(|i| i.as_str()) == Some(PLUGIN_ID))
     {
-        Some(r) => r.get("enabled").and_then(|e| e.as_bool()) == Some(false),
+        Some(r) => !crate::upstream::plugin::record_active(r),
         None => true,
     }
 }

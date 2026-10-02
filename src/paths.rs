@@ -7,14 +7,20 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let (primary, fallback) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    std::env::var_os(primary)
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os(fallback).filter(|v| !v.is_empty()))
         .map(PathBuf::from)
 }
 
 /// `$KIMI_CODE_HOME`, else `~/.kimi-code`.
 pub fn kimi_home() -> PathBuf {
-    if let Some(p) = std::env::var_os("KIMI_CODE_HOME") {
+    if let Some(p) = std::env::var_os("KIMI_CODE_HOME").filter(|p| !p.is_empty()) {
         return PathBuf::from(p);
     }
     home_dir()
@@ -93,6 +99,25 @@ pub fn spawn_self(args: &[&str]) {
     let _ = detach(Command::new(exe).args(args)).spawn();
 }
 
+/// OS locks are released even when the TUI kills a process. Keep lock files
+/// in place: unlinking one would let new callers lock a different inode.
+pub fn lock(path: &Path, wait: bool) -> Option<std::fs::File> {
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    if wait {
+        file.lock().ok()?;
+    } else {
+        file.try_lock().ok()?;
+    }
+    Some(file)
+}
+
 /// Caches for sessions, repos and directories nobody has looked at in this
 /// long are dropped by the daily sweep.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 86_400);
@@ -122,7 +147,16 @@ pub fn sweep_cache() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(a) = age(&path) else { continue };
         let orphan = name.ends_with(".tmp") && a > Duration::from_secs(60);
-        let cold = ["session-", "git-", "pr-", "tasks-", "dance-"]
+        let cold = !name.ends_with(".lock")
+            && [
+                "session-",
+                "location-",
+                "quota-",
+                "git-",
+                "pr-",
+                "tasks-",
+                "dance-",
+            ]
             .iter()
             .any(|p| name.starts_with(p))
             && a > CACHE_MAX_AGE;
